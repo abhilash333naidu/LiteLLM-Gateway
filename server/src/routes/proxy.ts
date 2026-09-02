@@ -285,20 +285,20 @@ export function setStickyModel(messages: ChatMessage[], modelDbId: number, sessi
   }
 }
 
-// OpenAI-compatible /models endpoint (used by Hermes for metadata) 
+// OpenAI-compatible /models endpoint (used by Hermes for metadata)
 // shows API models which is linked by the user
 proxyRouter.get('/models', (req: Request, res: Response) => {
   if (!requireInferenceAuth(req, res)) return;
 
-  // By default we return the WHOLE catalog (one row per model id), each tagged
-  // with whether it is currently usable, so a client can see everything and know
-  // what's connected vs. disabled/keyless (#242). `?available=true` (aliases
-  // `?connected=true`, `?ready=true`) narrows the list to only models that can
-  // serve a request right now — the previous default behavior. The `ready`
-  // alias is the machine-readable filter a meta-gateway uses (#433) to ask
-  // "which models can this instance actually serve now". `available` is computed as
-  // "enabled AND an enabled key can serve it"; dedup prefers an available
-  // instance of a model id over a disabled/keyless one.
+  // Default listing is the operator's active chain slice, not the whole
+  // catalog. When a chain is active, buildModelListing() is already gated to
+  // profile_models.enabled=1 AND available=1, so /v1/models and
+  // /v1/models?available=true converge to the same 28-model set the dashboard
+  // shows as "in the chain" — the harnesses' picker therefore mirrors the
+  // dashboard toggle without client-side filtering. With no active chain the
+  // old behaviour is preserved: the whole catalog is returned, each row tagged
+  // with whether it is currently usable (#242), and ?available=true narrows to
+  // usable rows (#433). dedup prefers an available instance.
   // Shared catalog listing (one source of truth for the OpenAI and Anthropic
   // /v1/models endpoints — see services/model-listing.ts). `autoContextWindow`
   // is the honest ceiling for the virtual "auto" model: the largest context
