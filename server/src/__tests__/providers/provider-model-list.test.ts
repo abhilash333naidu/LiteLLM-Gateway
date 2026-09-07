@@ -4,6 +4,7 @@ import { OpenAICompatProvider } from '../../providers/openai-compat.js';
 import { GoogleProvider } from '../../providers/google.js';
 import { CohereProvider } from '../../providers/cohere.js';
 import { AIHordeProvider } from '../../providers/aihorde.js';
+import { CloudflareProvider } from '../../providers/cloudflare.js';
 import { getProvider } from '../../providers/index.js';
 import type {
   ChatCompletionResponse,
@@ -354,5 +355,55 @@ describe('AIHordeProvider.listChatModels', () => {
     } as unknown as Response));
 
     await expect(new AIHordeProvider().listChatModels(null)).rejects.toThrow(/HTTP 503/);
+  });
+});
+
+describe('CloudflareProvider.listChatModels', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('builds the search URL from the parsed key and maps result names', async () => {
+    const captured: { url: string; headers: Record<string, string> } = { url: '', headers: {} };
+    vi.spyOn(global, 'fetch').mockImplementationOnce(async (url, init) => {
+      captured.url = String(url);
+      captured.headers = ((init as RequestInit)?.headers ?? {}) as Record<string, string>;
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        headers: new Headers(),
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({
+              result: [{ name: '@cf/mistral/mistral-7b' }, { name: '@cf/meta/llama-3.1-70b' }],
+            }),
+          ),
+      } as unknown as Response;
+    });
+
+    const models = await new CloudflareProvider().listChatModels('acc123:tok456');
+
+    expect(captured.url).toBe('https://api.cloudflare.com/client/v4/accounts/acc123/ai/models/search');
+    expect(captured.headers['Authorization']).toBe('Bearer tok456');
+    expect(models.map((m) => m.id)).toEqual(['@cf/meta/llama-3.1-70b', '@cf/mistral/mistral-7b']);
+  });
+
+  it('throws on an unparseable key', async () => {
+    await expect(new CloudflareProvider().listChatModels('no-colon-here')).rejects.toThrow(
+      /account_id:api_token/,
+    );
+  });
+
+  it('throws on a non-ok response', async () => {
+    vi.spyOn(global, 'fetch').mockImplementationOnce(async () => ({
+      ok: false,
+      status: 403,
+      statusText: 'Forbidden',
+      headers: new Headers(),
+      text: () => Promise.resolve('denied'),
+    } as unknown as Response));
+
+    await expect(new CloudflareProvider().listChatModels('acc123:tok')).rejects.toThrow(/HTTP 403/);
   });
 });
