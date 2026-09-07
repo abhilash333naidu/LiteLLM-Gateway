@@ -561,6 +561,26 @@ describe('live-model-sync probe rules (Tier1+Tier2 rollout)', () => {
     expect(result.counts.paidSkipped).toBe(0);
   });
 
+  it('preserves well-formed vision/context evidence from listChatModels', async () => {
+    process.env.LIVE_MODEL_SYNC_PLATFORMS = 'sealion';
+    addApiKey('sealion');
+    const { provider } = listChatModelsProvider('sealion', [
+      { id: 'sealion-vl', vision: true, contextWindow: 131072 },
+      { id: 'sealion-text', vision: 'yes', contextWindow: 'huge' },
+      { id: 'sealion-neg', contextWindow: -5 },
+    ]);
+    (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(provider);
+    const result = await runLiveModelSync(getDb());
+    expect(result.ok).toBe(true);
+    expect(result.counts.added).toBe(3);
+    const rows = getDb().prepare(
+      "SELECT model_id, supports_vision, context_window FROM models WHERE source = 'live' ORDER BY model_id",
+    ).all() as Array<{ model_id: string; supports_vision: number; context_window: number | null }>;
+    expect(rows.find(r => r.model_id === 'sealion-vl')).toMatchObject({ supports_vision: 1, context_window: 131072 });
+    expect(rows.find(r => r.model_id === 'sealion-text')).toMatchObject({ supports_vision: 0, context_window: null });
+    expect(rows.find(r => r.model_id === 'sealion-neg')).toMatchObject({ supports_vision: 0, context_window: null });
+  });
+
   it('unknown platforms in the env list are skipped silently', async () => {
     process.env.LIVE_MODEL_SYNC_PLATFORMS = 'frobnicate';
     const result = await runLiveModelSync(getDb());

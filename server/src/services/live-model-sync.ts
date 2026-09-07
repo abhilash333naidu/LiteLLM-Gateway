@@ -389,7 +389,16 @@ async function fetchViaListChatModels(
     const record = asRecord(item);
     const id = record && typeof record.id === 'string' ? record.id.trim() : '';
     if (!id || id.length > MAX_MODEL_ID_LENGTH) continue;
-    entries.push({ id });
+    // Preserve only well-formed capability evidence; anything else stays
+    // unknown so the insert-time defaults apply.
+    const entry: ListedChatModel = { id };
+    if (typeof record?.tools === 'boolean') entry.tools = record.tools;
+    if (typeof record?.vision === 'boolean') entry.vision = record.vision;
+    const contextWindow = record?.contextWindow;
+    if (typeof contextWindow === 'number' && Number.isFinite(contextWindow) && contextWindow > 0) {
+      entry.contextWindow = Math.floor(contextWindow);
+    }
+    entries.push(entry);
   }
   if (entries.length === 0) throw new Error(platform + ' returned an empty model list');
 
