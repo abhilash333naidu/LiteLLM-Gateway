@@ -2,6 +2,10 @@ import { createHash } from 'node:crypto';
 import type { Db } from '../db/types.js';
 import { getDb, getSetting, setSetting } from '../db/index.js';
 import type { Scheduler } from '../lib/scheduler.js';
+import { MAX_DISCOVERED_MODELS, readCappedBody } from './model-discovery.js';
+import { customModelSeed } from './custom-model-seed.js';
+import { ensureModelInProfiles } from './profile-models.js';
+import { isCatalogModelTombstoned } from './model-state.js';
 
 // ── Scheduled live-model discovery ───────────────────────────────────────────
 //
@@ -106,14 +110,185 @@ export function getLiveDiscoveryState(): LiveDiscoveryState {
   return { enabled: liveDiscoveryIntervalMs() > 0, lastRunMs, lastError, lastResult };
 }
 
-/** Keyless OpenRouter roster (slice 2). */
-async function fetchOpenRouterModels(): Promise<CollectedLiveModel[]> {
-  throw new Error('openrouter collector not implemented');
+/** Keyless OpenRouter roster: free, text-only models with capability evidence.
+ *  parseModelCatalog cannot serve here — it drops the tools signal — so this
+ *  is a DEDICATED row mapper over the raw OpenRouter envelope. */
+const OPENROUTER_MODELS_URL = 'https://openrouter.ai/api/v1/models';
+const OPENROUTER_TIMEOUT_MS = 15_000;
+
+/** Ids longer than this are certainly not model ids; skip rather than store. */
+const MAX_MODEL_ID_LENGTH = 256;
+
+interface CollectorOutput {
+  models: CollectedLiveModel[];
+  /** Entries filtered as non-free / non-text / unverifiable. */
+  paidSkipped: number;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function asLowerStrings(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.filter(v => typeof v === 'string').map(v => (v as string).toLowerCase());
+}
+
+function isZeroNumber(raw: unknown): boolean {
+  if (typeof raw === 'number') return Number.isFinite(raw) && raw === 0;
+  if (typeof raw === 'string' && raw.trim() !== '') {
+    const n = Number(raw);
+    return Number.isFinite(n) && n === 0;
+  }
+  return false;
+}
+
+/** One OpenRouter catalog entry mapped to a free text model, or null when it
+ *  is paid, non-text, or carries no verifiable free/text evidence. The `:free`
+ *  suffix stays verbatim — it is part of the routable id. */
+function mapOpenRouterEntry(entry: unknown): CollectedLiveModel | null {
+  const record = asRecord(entry);
+  if (!record) return null;
+  const rawId = record.id;
+  const id = typeof rawId === 'string' ? rawId.trim() : '';
+  if (!id || id.length > MAX_MODEL_ID_LENGTH) return null;
+
+  // Free means prompt AND completion are both zero. A missing pricing block
+  // is not evidence — it is skipped, never assumed free.
+  const pricing = asRecord(record.pricing);
+  if (!pricing || !isZeroNumber(pricing.prompt) || !isZeroNumber(pricing.completion)) return null;
+
+  // Text-only: input must carry text (image input marks vision), output must
+  // be text and nothing else — lyria-style audio/image output rows are out.
+  const architecture = asRecord(record.architecture);
+  const modalitySides = typeof architecture?.modality === 'string'
+    ? String(architecture.modality).toLowerCase().split('->')
+    : [];
+  const input = architecture ? asLowerStrings(architecture.input_modalities) : undefined;
+  const output = architecture ? asLowerStrings(architecture.output_modalities) : undefined;
+  const inputModalities = input
+    ?? modalitySides[0]?.split('+').map(s => s.trim()).filter(Boolean)
+    ?? [];
+  const outputModalities = output
+    ?? (modalitySides[1] !== undefined ? modalitySides[1].split('+').map(s => s.trim()).filter(Boolean) : []);
+  if (!inputModalities.includes('text')) return null;
+  if (outputModalities.length === 0 || !outputModalities.every(m => m === 'text')) return null;
+
+  // Tools: an advertised parameter list without 'tools' is evidence of
+  // ABSENCE (writes 0); no list at all is unknown (defaults to 1 on insert).
+  const params = asLowerStrings(record.supported_parameters)
+    ?? (architecture ? asLowerStrings(architecture.supported_parameters) : undefined);
+  const tools = params === undefined ? undefined : params.includes('tools');
+
+  const contextRaw = record.context_length;
+  const contextWindow = typeof contextRaw === 'number' && Number.isFinite(contextRaw) && contextRaw > 0
+    ? Math.floor(contextRaw)
+    : undefined;
+
+  return { id, tools, vision: inputModalities.includes('image'), contextWindow };
+}
+
+async function fetchOpenRouterModels(): Promise<CollectorOutput> {
+  let res: Response;
+  try {
+    res = await fetch(OPENROUTER_MODELS_URL, { signal: AbortSignal.timeout(OPENROUTER_TIMEOUT_MS) });
+  } catch (err: unknown) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new Error('OpenRouter /models unreachable: ' + reason);
+  }
+  const bodyText = await readCappedBody(res);
+  if (!res.ok) throw new Error('OpenRouter /models returned HTTP ' + res.status);
+  let payload: unknown;
+  try {
+    payload = JSON.parse(bodyText);
+  } catch {
+    throw new Error('OpenRouter /models did not return JSON');
+  }
+  const record = asRecord(payload);
+  const entries = record && (Array.isArray(record.data)
+    ? record.data
+    : Array.isArray(record.models) ? record.models : null);
+  if (!entries) throw new Error('OpenRouter /models did not return a model list');
+
+  const models: CollectedLiveModel[] = [];
+  const seenIds = new Set<string>();
+  let paidSkipped = 0;
+  for (const entry of entries) {
+    const mapped = mapOpenRouterEntry(entry);
+    if (!mapped) {
+      paidSkipped += 1;
+      continue;
+    }
+    if (seenIds.has(mapped.id)) continue;
+    seenIds.add(mapped.id);
+    models.push(mapped);
+    if (models.length >= MAX_DISCOVERED_MODELS) break;
+  }
+  return { models, paidSkipped };
 }
 
 /** Keyed free-tier gateway roster (slice 3). */
-async function fetchKeyedPlatformModels(_db: Db, platform: string): Promise<CollectedLiveModel[]> {
-  throw new Error(`keyed collector not implemented for ${platform}`);
+async function fetchKeyedPlatformModels(_db: Db, platform: string): Promise<CollectorOutput> {
+  throw new Error('keyed collector not implemented for ' + platform);
+}
+
+/** Insert one live row plus its fallback chain and profile entries, mirroring
+ *  the custom-model-register write path (seeded ranks, rpm/rpd limits). */
+function insertLiveModelRow(db: Db, platform: string, model: CollectedLiveModel): void {
+  const seed = customModelSeed(db);
+  const info = db.prepare(`
+    INSERT INTO models
+      (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
+       rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
+       enabled, key_id, supports_tools, supports_vision, source, endpoint_scope)
+    VALUES (?, ?, ?, ?, ?, ?, 20, 50, NULL, NULL, '', ?, 1, NULL, ?, ?, 'live', '')
+  `).run(
+    platform,
+    model.id,
+    model.id,
+    seed.intelligenceRank,
+    seed.speedRank,
+    seed.sizeLabel,
+    model.contextWindow ?? null,
+    model.tools === undefined ? 1 : (model.tools ? 1 : 0),
+    model.vision ? 1 : 0,
+  );
+  const modelDbId = Number(info.lastInsertRowid);
+  const max = db.prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config').get() as { m: number };
+  db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)').run(modelDbId, max.m + 1);
+  ensureModelInProfiles(db, modelDbId);
+}
+
+interface ExistingRow {
+  id: number;
+  model_id: string;
+  source: string;
+  enabled: number;
+}
+
+/** Apply one platform roster: add unseen ids, never touch existing rows'
+ *  metadata, never re-add a user-tombstoned model. One transaction. */
+function applyPlatformModels(db: Db, platform: string, models: CollectedLiveModel[], counts: LiveDiscoveryCounts): void {
+  db.transaction(() => {
+    const existing = db.prepare('SELECT id, model_id, source, enabled FROM models WHERE platform = ?').all(platform) as ExistingRow[];
+    const byId = new Map(existing.map(row => [row.model_id, row]));
+    for (const model of models) {
+      if (byId.has(model.id)) {
+        // Present already — a local disable, a catalog row, a user row: all win.
+        counts.skipped += 1;
+        continue;
+      }
+      if (isCatalogModelTombstoned(db, 'chat', platform, model.id)) {
+        counts.tombstoned += 1;
+        continue;
+      }
+      insertLiveModelRow(db, platform, model);
+      byId.set(model.id, { id: -1, model_id: model.id, source: 'live', enabled: 1 });
+      counts.added += 1;
+    }
+  })();
 }
 
 /** sha256 over canonical sorted JSON of {platform → sorted model ids} seen. */
@@ -148,10 +323,14 @@ export async function runLiveModelSync(db: Db): Promise<LiveDiscoveryResult> {
   try {
     for (const platform of liveDiscoveryPlatforms()) {
       try {
-        const models = platform === 'openrouter'
+        const out = platform === 'openrouter'
           ? await fetchOpenRouterModels()
           : await fetchKeyedPlatformModels(db, platform);
-        seen[platform] = models.map(m => m.id);
+        counts.paidSkipped += out.paidSkipped;
+        // An empty list is inconclusive, never evidence of removal.
+        if (out.models.length === 0) throw new Error(platform + ' returned an empty model list');
+        seen[platform] = out.models.map(m => m.id);
+        applyPlatformModels(db, platform, out.models, counts);
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         failures.push({ platform, error: message });
