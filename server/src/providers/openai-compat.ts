@@ -14,6 +14,7 @@ import { invalidToolCallReasons, isToolArgumentValidationEnabled } from '../lib/
 import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
 import { providerTimeoutMs } from '../lib/provider-timeout.js';
 import { isAbortLikeError } from '../lib/error-classify.js';
+import { hasModelList, parseModelCatalog, readCappedBody, type DiscoveredModel } from '../services/model-discovery.js';
 
 /**
  * Generic provider for platforms that use an OpenAI-compatible API.
@@ -26,6 +27,9 @@ export class OpenAICompatProvider extends BaseProvider {
   private readonly baseUrl: string;
   private readonly extraHeaders: Record<string, string>;
   private readonly validateUrl?: string;
+  /** Catalog override for providers whose model list lives off the /v1 path
+   * (Kilo's /v1/models 405s; its gateway list answers at /api/gateway/models). */
+  private readonly listModelsUrl?: string;
   /** Per-provider HTTP timeout override. OpenAI-compatible gateways often buffer
    * non-streaming responses until generation completes, and reasoning models can
    * take >15s before first byte. Default 60000. */
@@ -41,6 +45,7 @@ export class OpenAICompatProvider extends BaseProvider {
     baseUrl: string;
     extraHeaders?: Record<string, string>;
     validateUrl?: string;
+    listModelsUrl?: string;
     timeoutMs?: number;
     keyless?: boolean;
     forceSingleToolCall?: boolean;
@@ -51,6 +56,7 @@ export class OpenAICompatProvider extends BaseProvider {
     this.baseUrl = opts.baseUrl;
     this.extraHeaders = opts.extraHeaders ?? {};
     this.validateUrl = opts.validateUrl;
+    this.listModelsUrl = opts.listModelsUrl;
     // PROVIDER_TIMEOUT_<PLATFORM> wins over the registration default (#547).
     this.timeoutMs = providerTimeoutMs(opts.platform, opts.timeoutMs ?? 60_000);
     this.keyless = opts.keyless ?? false;
@@ -412,6 +418,47 @@ export class OpenAICompatProvider extends BaseProvider {
   async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<KeyValidationResult> {
     const res = await this.fetchCatalogEndpoint(this.validateUrl ?? this.modelsUrl, apiKey, quotaContext);
     return this.validationResult(res);
+  }
+
+  /**
+   * Live chat-model listing off this provider's catalog URL (or listModelsUrl
+   * when the catalog lives off the /v1 path). Same 30s request-bounded GET as
+   * fetchCatalogEndpoint, but a null apiKey — or a keyless platform — sends no
+   * Authorization header at all rather than a bare bearer.
+   */
+  async listChatModels(apiKey: string | null): Promise<DiscoveredModel[]> {
+    const url = this.listModelsUrl ?? this.modelsUrl;
+    const headers: Record<string, string> = { ...this.extraHeaders };
+    if (apiKey != null && !this.keyless) headers['Authorization'] = `Bearer ${apiKey}`;
+    const res = await this.fetchWithTimeout(url, {
+      method: 'GET',
+      headers,
+    }, 30000, { timeoutBounds: 'request' }).then(r => {
+      recordQuotaObservationsFromResponse(r, {
+        platform: this.platform,
+        endpoint: 'models',
+      });
+      return r;
+    });
+
+    const bodyText = await readCappedBody(res);
+    if (!res.ok) {
+      throw new Error(`${this.name} model listing failed (HTTP ${res.status})`);
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(bodyText);
+    } catch {
+      throw new Error(`${this.name} model listing did not return JSON.`);
+    }
+    if (!hasModelList(payload)) {
+      throw new Error(`${this.name} model listing did not return a model list in a format this gateway understands.`);
+    }
+    const models = parseModelCatalog(payload);
+    if (models.length === 0) {
+      throw new Error(`${this.name} model listing returned no models.`);
+    }
+    return models;
   }
 }
 
