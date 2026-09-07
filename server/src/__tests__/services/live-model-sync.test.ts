@@ -6,6 +6,23 @@ import {
   getLiveDiscoveryState,
   liveDiscoveryIntervalMs,
 } from '../../services/live-model-sync.js';
+import { getProvider } from '../../providers/index.js';
+import { OpenAICompatProvider } from '../../providers/openai-compat.js';
+import { decrypt } from '../../lib/crypto.js';
+
+// The sync talks to keyed providers ONLY through getProvider + fetchModelCatalog;
+// stub the registry edge so each test controls what a platform "serves".
+vi.mock('../../providers/index.js', async () => {
+  const actual = await vi.importActual('../../providers/index.js');
+  return { ...actual, getProvider: vi.fn() };
+});
+
+// Stored credentials are decrypted by the crypto module; return a stable
+// plaintext so keyed tests never touch real key material.
+vi.mock('../../lib/crypto.js', async () => {
+  const actual = await vi.importActual('../../lib/crypto.js');
+  return { ...actual, decrypt: vi.fn(() => 'plain-test-key') };
+});
 
 // Slice 1: contract shell — env parsing, state, scheduler wiring. No network.
 
@@ -258,5 +275,137 @@ describe('live-model-sync openrouter collector', () => {
     expect(second.fingerprint).toBe(first.fingerprint);
     expect(second.counts.added).toBe(0);
     expect(second.counts.skipped).toBe(2);
+  });
+});
+
+function addApiKey(platform: string, status = 'healthy', enabled = 1): void {
+  getDb().prepare(`
+    INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+    VALUES (?, 'test-key', 'enc', 'iv', 'tag', ?, ?)
+  `).run(platform, status, enabled);
+}
+
+function keyedProviderServing(ids: string[], status = 200): { provider: OpenAICompatProvider; catalog: ReturnType<typeof vi.fn> } {
+  const provider = new OpenAICompatProvider({ platform: 'opencode', name: 'OpenCode Zen', baseUrl: 'https://opencode.ai/zen/v1' });
+  const catalog = vi.spyOn(provider, 'fetchModelCatalog')
+    .mockResolvedValue(new Response(JSON.stringify({ data: ids.map(id => ({ id })) }), { status }));
+  return { provider, catalog };
+}
+
+describe('live-model-sync keyed collectors', () => {
+  beforeEach(() => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    process.env.DEV_MODE = 'true';
+    process.env.NODE_ENV = 'test';
+    initDb(':memory:');
+    getDb().exec(
+      'DELETE FROM profile_models; DELETE FROM fallback_config; DELETE FROM api_keys; DELETE FROM models; DELETE FROM requests; DELETE FROM catalog_model_tombstones; DELETE FROM model_overrides;',
+    );
+    getDb().prepare("DELETE FROM settings WHERE key LIKE 'live_discovery_%'").run();
+    vi.clearAllMocks();
+    process.env.LIVE_MODEL_SYNC_INTERVAL_MS = '3600000';
+    process.env.LIVE_MODEL_SYNC_PLATFORMS = 'opencode';
+  });
+
+  afterEach(() => {
+    delete process.env.LIVE_MODEL_SYNC_INTERVAL_MS;
+    delete process.env.LIVE_MODEL_SYNC_PLATFORMS;
+    vi.unstubAllGlobals();
+  });
+
+  it('opencode admits only *-free ids plus big-pickle', async () => {
+    addApiKey('opencode');
+    const { provider } = keyedProviderServing(['model-a-free', 'big-pickle', 'gpt-4o', 'freebie']);
+    (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(provider);
+
+    const result = await runLiveModelSync(getDb());
+    expect(result.ok).toBe(true);
+    expect(result.counts.added).toBe(2);
+    expect(result.counts.paidSkipped).toBe(2);
+    expect(liveRows().map(r => r.model_id)).toEqual(['big-pickle', 'model-a-free']);
+    // The stored credential is decrypted and handed to the catalog fetch.
+    expect(decrypt).toHaveBeenCalledWith('enc', 'iv', 'tag');
+  });
+
+  it('groq admits every served model id', async () => {
+    process.env.LIVE_MODEL_SYNC_PLATFORMS = 'groq';
+    addApiKey('groq', 'unknown');
+    const groq = new OpenAICompatProvider({ platform: 'groq', name: 'Groq', baseUrl: 'https://api.groq.com/openai/v1' });
+    vi.spyOn(groq, 'fetchModelCatalog')
+      .mockResolvedValue(new Response(JSON.stringify({ data: [{ id: 'llama-3.3-70b-versatile' }, { id: 'paid-pro' }] }), { status: 200 }));
+    (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(groq);
+
+    const result = await runLiveModelSync(getDb());
+    expect(result.counts.added).toBe(2);
+    expect(result.counts.paidSkipped).toBe(0);
+  });
+
+  it('skips a platform with no usable key without failing', async () => {
+    addApiKey('opencode', 'invalid');
+    addApiKey('opencode', 'healthy', 0);
+    const { provider, catalog } = keyedProviderServing(['model-a-free']);
+    (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(provider);
+
+    const result = await runLiveModelSync(getDb());
+    expect(catalog).not.toHaveBeenCalled();
+    expect(result.platforms).toEqual([]);
+    expect(result.failures).toEqual([]);
+    expect(liveRows()).toEqual([]);
+  });
+
+  it('leaves error-status keys out of rotation', async () => {
+    addApiKey('opencode', 'error');
+    const { catalog } = keyedProviderServing(['model-a-free']);
+    (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(
+      new OpenAICompatProvider({ platform: 'opencode', name: 'x', baseUrl: 'https://opencode.ai/zen/v1' }),
+    );
+    const result = await runLiveModelSync(getDb());
+    expect(catalog).not.toHaveBeenCalled();
+    expect(result.failures).toEqual([]);
+  });
+
+  it('skips providers that are not OpenAI-compatible catalogs', async () => {
+    addApiKey('google');
+    process.env.LIVE_MODEL_SYNC_PLATFORMS = 'google';
+    (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue({ platform: 'google' });
+
+    const result = await runLiveModelSync(getDb());
+    expect(result.platforms).toEqual([]);
+    expect(result.failures).toEqual([]);
+    expect(liveRows()).toEqual([]);
+  });
+
+  it('a keyed 401 is recorded and never disables existing rows', async () => {
+    addApiKey('opencode');
+    const provider = new OpenAICompatProvider({ platform: 'opencode', name: 'OpenCode Zen', baseUrl: 'https://opencode.ai/zen/v1' });
+    vi.spyOn(provider, 'fetchModelCatalog').mockResolvedValue(new Response('denied', { status: 401 }));
+    (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(provider);
+    getDb().prepare(`
+      INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled, source, endpoint_scope)
+      VALUES ('opencode', 'model-a-free', 'model-a-free', 50, 50, 'Medium', 1, 'live', '')
+    `).run();
+
+    const result = await runLiveModelSync(getDb());
+    expect(result.ok).toBe(false);
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0]!.platform).toBe('opencode');
+    const row = getDb().prepare("SELECT enabled FROM models WHERE platform = 'opencode'").get() as { enabled: number };
+    expect(row.enabled).toBe(1);
+  });
+
+  it('an empty keyed list is inconclusive: failure recorded, rows untouched', async () => {
+    addApiKey('opencode');
+    const { provider } = keyedProviderServing([]);
+    (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(provider);
+    getDb().prepare(`
+      INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled, source, endpoint_scope)
+      VALUES ('opencode', 'model-a-free', 'model-a-free', 50, 50, 'Medium', 1, 'live', '')
+    `).run();
+
+    const result = await runLiveModelSync(getDb());
+    expect(result.failures).toHaveLength(1);
+    expect(result.counts.deprecated).toBe(0);
+    const row = getDb().prepare("SELECT enabled FROM models WHERE platform = 'opencode'").get() as { enabled: number };
+    expect(row.enabled).toBe(1);
   });
 });

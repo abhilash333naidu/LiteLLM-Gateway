@@ -2,10 +2,16 @@ import { createHash } from 'node:crypto';
 import type { Db } from '../db/types.js';
 import { getDb, getSetting, setSetting } from '../db/index.js';
 import type { Scheduler } from '../lib/scheduler.js';
-import { MAX_DISCOVERED_MODELS, readCappedBody } from './model-discovery.js';
+import { MAX_DISCOVERED_MODELS, hasModelList, parseModelCatalog, readCappedBody } from './model-discovery.js';
 import { customModelSeed } from './custom-model-seed.js';
 import { ensureModelInProfiles } from './profile-models.js';
 import { isCatalogModelTombstoned } from './model-state.js';
+import { getProvider } from '../providers/index.js';
+import { OpenAICompatProvider } from '../providers/openai-compat.js';
+import { decrypt } from '../lib/crypto.js';
+import { decryptProxyUrl } from '../lib/key-proxy.js';
+import { withKeyProxy } from '../lib/proxy.js';
+import type { Platform } from '@freellmapi/shared/types.js';
 
 // ── Scheduled live-model discovery ───────────────────────────────────────────
 //
@@ -123,6 +129,9 @@ interface CollectorOutput {
   models: CollectedLiveModel[];
   /** Entries filtered as non-free / non-text / unverifiable. */
   paidSkipped: number;
+  /** True when the platform was not attempted at all (no compatible provider
+   *  or no usable key) — the run skips it without recording a failure. */
+  notAttempted?: boolean;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -229,9 +238,80 @@ async function fetchOpenRouterModels(): Promise<CollectorOutput> {
   return { models, paidSkipped };
 }
 
-/** Keyed free-tier gateway roster (slice 3). */
-async function fetchKeyedPlatformModels(_db: Db, platform: string): Promise<CollectorOutput> {
-  throw new Error('keyed collector not implemented for ' + platform);
+/** Keyed free-tier gateway roster. Only OpenAI-compatible providers that expose
+ *  fetchModelCatalog qualify (google/cohere/cloudflare/aihorde and any other
+ *  class are skipped), and only when at least one enabled healthy-or-unknown
+ *  key exists — one platform's failure is isolated and never disables rows. */
+async function fetchKeyedPlatformModels(db: Db, platform: string): Promise<CollectorOutput> {
+  const notAttempted: CollectorOutput = { models: [], paidSkipped: 0, notAttempted: true };
+  const provider = getProvider(platform as Platform);
+  if (!(provider instanceof OpenAICompatProvider) || typeof provider.fetchModelCatalog !== 'function') {
+    return notAttempted;
+  }
+  const keyRow = db.prepare(
+    "SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy','unknown') ORDER BY id ASC LIMIT 1",
+  ).get(platform) as
+    | { encrypted_key: string; iv: string; auth_tag: string; [column: string]: unknown }
+    | undefined;
+  if (!keyRow) return notAttempted;
+
+  let apiKey: string;
+  try {
+    apiKey = decrypt(keyRow.encrypted_key, keyRow.iv, keyRow.auth_tag);
+  } catch (err: unknown) {
+    throw new Error(platform + ' stored key could not be decrypted');
+  }
+
+  let res: Response;
+  try {
+    // Mirror health.ts: probe through the key's own proxy exit.
+    const proxyRow = {
+      proxy_encrypted: (keyRow.proxy_encrypted as string | null) ?? null,
+      proxy_iv: (keyRow.proxy_iv as string | null) ?? null,
+      proxy_auth_tag: (keyRow.proxy_auth_tag as string | null) ?? null,
+    };
+    res = await withKeyProxy(decryptProxyUrl(proxyRow), () => provider.fetchModelCatalog(apiKey));
+  } catch (err: unknown) {
+    const reason = err instanceof Error ? err.message : String(err);
+    throw new Error(platform + ' /models unreachable: ' + reason);
+  }
+  const bodyText = await readCappedBody(res);
+  if (!res.ok) throw new Error(platform + ' /models returned HTTP ' + res.status);
+  let payload: unknown;
+  try {
+    payload = JSON.parse(bodyText);
+  } catch {
+    throw new Error(platform + ' /models did not return JSON');
+  }
+  if (!hasModelList(payload)) throw new Error(platform + ' /models did not return a model list');
+  const discovered = parseModelCatalog(payload);
+  if (discovered.length === 0) throw new Error(platform + ' returned an empty model list');
+
+  // Per-platform free filters: opencode serves `*-free` ids plus big-pickle,
+  // groq serves everything on the key. Anything else is presumably paid.
+  const models: CollectedLiveModel[] = [];
+  let paidSkipped = 0;
+  for (const entry of discovered) {
+    if (!liveFreePass(platform, entry.id)) {
+      paidSkipped += 1;
+      continue;
+    }
+    models.push({ id: entry.id, tools: undefined, vision: entry.vision, contextWindow: entry.contextWindow });
+  }
+  return { models, paidSkipped };
+}
+
+/** Whether a keyed roster id counts as free on this platform. */
+function liveFreePass(platform: string, id: string): boolean {
+  if (platform === 'groq') return true;
+  if (platform === 'opencode') return id === 'big-pickle' || livePatternMatches('*-free', id);
+  return false;
+}
+
+/** Glob match where `*` matches any run of chars (incl. empty). */
+function livePatternMatches(pattern: string, id: string): boolean {
+  const escaped = pattern.split('*').map(seg => seg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  return new RegExp('^' + escaped.join('.*') + '$').test(id);
 }
 
 /** Insert one live row plus its fallback chain and profile entries, mirroring
@@ -327,6 +407,7 @@ export async function runLiveModelSync(db: Db): Promise<LiveDiscoveryResult> {
           ? await fetchOpenRouterModels()
           : await fetchKeyedPlatformModels(db, platform);
         counts.paidSkipped += out.paidSkipped;
+        if (out.notAttempted) continue;
         // An empty list is inconclusive, never evidence of removal.
         if (out.models.length === 0) throw new Error(platform + ' returned an empty model list');
         seen[platform] = out.models.map(m => m.id);
