@@ -174,6 +174,7 @@ register(new OpenAICompatProvider({
   name: 'Kilo Gateway',
   baseUrl: 'https://api.kilo.ai/api/gateway/v1',
   validateUrl: 'https://api.kilo.ai/api/gateway/models',
+  listModelsUrl: 'https://api.kilo.ai/api/gateway/models',
   keyless: true,
 }));
 

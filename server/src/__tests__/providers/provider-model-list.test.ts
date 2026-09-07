@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { BaseProvider } from '../../providers/base.js';
 import { OpenAICompatProvider } from '../../providers/openai-compat.js';
+import { getProvider } from '../../providers/index.js';
 import type {
   ChatCompletionResponse,
   ChatCompletionChunk,
@@ -152,5 +153,30 @@ describe('OpenAICompatProvider.listChatModels', () => {
     mockCatalog(JSON.stringify({ data: [] }));
 
     await expect(provider.listChatModels('k')).rejects.toThrow(/no models/i);
+  });
+});
+
+describe('kilo registration', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('lists via the gateway models URL (its /v1/models 405s)', async () => {
+    let capturedUrl = '';
+    vi.spyOn(global, 'fetch').mockImplementationOnce(async (url) => {
+      capturedUrl = String(url);
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        headers: new Headers(),
+        text: () => Promise.resolve(JSON.stringify({ data: [{ id: 'kilo-model' }] })),
+      } as unknown as Response;
+    });
+
+    const models = await getProvider('kilo')!.listChatModels(null);
+
+    expect(capturedUrl).toBe('https://api.kilo.ai/api/gateway/models');
+    expect(models.map((m) => m.id)).toEqual(['kilo-model']);
   });
 });
