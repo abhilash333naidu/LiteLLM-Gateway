@@ -10,6 +10,7 @@ import {
   refreshLicenseStatus,
   syncCatalog,
 } from '../services/catalog-sync.js';
+import { getLiveDiscoveryState, runLiveModelSync } from '../services/live-model-sync.js';
 
 export const premiumRouter = Router();
 
@@ -25,6 +26,7 @@ function statusPayload() {
     maskedKey: key ? maskKey(key) : null,
     license: getCachedLicenseStatus(),
     catalog: getSyncState(),
+    liveDiscovery: getLiveDiscoveryState(),
     // Where "Go Premium" / "recover key" links point. Overridable for forks.
     siteUrl: (process.env.PREMIUM_SITE_URL ?? 'https://freellmapi.co').replace(/\/$/, ''),
   };
@@ -93,7 +95,15 @@ premiumRouter.delete('/key', async (_req: Request, res: Response) => {
 premiumRouter.post('/sync', async (_req: Request, res: Response) => {
   await refreshLicenseStatus();
   const sync = await syncCatalog(true);
-  res.json({ ...statusPayload(), sync });
+  // Best-effort enrichment on top of the base sync: a live failure is
+  // reported, never thrown, so manual sync keeps its existing shape.
+  let live: unknown;
+  try {
+    live = await runLiveModelSync(getDb());
+  } catch (err) {
+    live = { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  res.json({ ...statusPayload(), sync, live });
 });
 
 /**

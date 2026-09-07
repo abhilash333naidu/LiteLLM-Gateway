@@ -14,6 +14,7 @@ import {
   reinstateUpstreamRetiredCatalogModel,
 } from './model-state.js';
 import { ensureAllModelsInProfiles } from './profile-models.js';
+import { runLiveModelSync } from './live-model-sync.js';
 
 // Generative-media modalities are routed into the separate media_models table
 // (see services/media.ts), never into the chat `models` table.
@@ -667,6 +668,22 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
 }
 
 /**
+ * Kick off the live model-discovery pass after a successful base sync.
+ * Fire-and-forget on purpose: discovery is best-effort enrichment (new free
+ * models between catalog bumps), so it must never change syncCatalog's
+ * result, settings, or tier. Failures only warn.
+ */
+function triggerLiveModelSync(db: Db): void {
+  try {
+    void runLiveModelSync(db).catch((err) => {
+      console.warn(`[catalog-sync] live model discovery failed: ${err instanceof Error ? err.message : err}`);
+    });
+  } catch (err) {
+    console.warn(`[catalog-sync] live model discovery failed: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+/**
  * Fetch the catalog, verify its signature, and apply it if it moves us forward.
  * `force` skips the `since` short-circuit — used right after a license key is
  * added or removed, where the tier can change without the version changing.
@@ -687,6 +704,8 @@ export async function syncCatalog(force = false): Promise<SyncResult> {
     if (res.status === 304) {
       setSetting(SETTING_LAST_SYNC_MS, String(Date.now()));
       setSetting(SETTING_LAST_ERROR, '');
+      // Still run discovery: additions land without an upstream version bump.
+      triggerLiveModelSync(db);
       return { ok: true, action: 'up_to_date', version: applied };
     }
     if (!res.ok) throw new Error(`catalog fetch failed: HTTP ${res.status}`);
@@ -727,11 +746,13 @@ export async function syncCatalog(force = false): Promise<SyncResult> {
       );
       setSetting(SETTING_LAST_SYNC_MS, String(Date.now()));
       setSetting(SETTING_LAST_ERROR, '');
+      triggerLiveModelSync(db);
       return { ok: true, action: 'applied', version: catalog.version, tier: catalog.tier, counts };
     }
 
     setSetting(SETTING_LAST_SYNC_MS, String(Date.now()));
     setSetting(SETTING_LAST_ERROR, '');
+    triggerLiveModelSync(db);
     return { ok: true, action: 'up_to_date', version: catalog.version, tier: catalog.tier };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
