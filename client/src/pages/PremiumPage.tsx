@@ -76,8 +76,9 @@ export default function PremiumPage() {
     )
   }
 
-  const { hasKey, maskedKey, license, catalog, siteUrl } = data
+  const { hasKey, maskedKey, license, catalog, liveDiscovery, siteUrl } = data
   const live = catalog.appliedTier === 'live'
+  const discovery = liveDiscovery?.lastResult ?? null
   return (
     <div>
       <PageHeader
@@ -113,6 +114,36 @@ export default function PremiumPage() {
             </p>
             {catalog.lastError && (
               <p className="text-destructive text-xs mt-2">{t('premium.lastSyncProblem', { error: catalog.lastError })}</p>
+            )}
+          </div>
+        </section>
+
+        {/* Local discovery state (hardcoded English: localization pass out of scope) */}
+        <section>
+          <h2 className="text-sm font-medium mb-3">Local discovery</h2>
+          <div className="rounded-3xl border bg-card p-5">
+            <div className="flex flex-wrap items-center gap-x-6 gap-y-3">
+              <div className="flex items-center gap-2">
+                <span className={`inline-block size-2 rounded-full ${liveDiscovery?.enabled ? 'bg-emerald-500' : 'bg-muted-foreground/40'}`} />
+                <span className="text-sm font-medium">{liveDiscovery?.enabled ? 'Enabled' : 'Disabled'}</span>
+              </div>
+              <span className="text-xs text-muted-foreground">
+                Last run: {fmtWhen(liveDiscovery?.lastRunMs ?? null) ?? 'never'}
+              </span>
+            </div>
+            {discovery && (
+              <p className="text-xs text-muted-foreground mt-3">
+                {discovery.counts.added} added · {discovery.counts.deprecated} deprecated
+                {discovery.platforms.length > 0 && ` · ${discovery.platforms.join(', ')}`}
+              </p>
+            )}
+            {discovery && discovery.failures.length > 0 && (
+              <p className="text-destructive text-xs mt-2">
+                {discovery.failures.map((f) => `${f.platform}: ${f.error}`).join(' · ')}
+              </p>
+            )}
+            {liveDiscovery?.lastError && (
+              <p className="text-destructive text-xs mt-2">Last discovery problem: {liveDiscovery.lastError}</p>
             )}
           </div>
         </section>

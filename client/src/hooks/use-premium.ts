@@ -19,11 +19,37 @@ export interface CatalogSyncState {
   lastError: string | null
 }
 
+export interface LiveDiscoveryCounts {
+  added: number
+  reinstated: number
+  deprecated: number
+  skipped: number
+  paidSkipped: number
+  tombstoned: number
+}
+
+export interface LiveDiscoveryResult {
+  ok: boolean
+  platforms: string[]
+  counts: LiveDiscoveryCounts
+  failures: Array<{ platform: string; error: string }>
+  fingerprint: string
+  durationMs: number
+}
+
+export interface LiveDiscoveryState {
+  enabled: boolean
+  lastRunMs: number | null
+  lastError: string | null
+  lastResult: LiveDiscoveryResult | null
+}
+
 export interface PremiumStatus {
   hasKey: boolean
   maskedKey: string | null
   license: LicenseStatus | null
   catalog: CatalogSyncState
+  liveDiscovery: LiveDiscoveryState
   siteUrl: string
 }
 
