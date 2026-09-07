@@ -9,6 +9,7 @@ import { BaseProvider, providerHttpError, type CompletionOptions, type KeyValida
 import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
 import { providerTimeoutMs } from '../lib/provider-timeout.js';
 import { resolveMaxTokens } from '../lib/sampling-params.js';
+import { hasModelList, parseModelCatalog, readCappedBody, type DiscoveredModel } from '../services/model-discovery.js';
 
 /**
  * AI Horde — free, community-powered inference served by volunteer workers and
@@ -218,5 +219,39 @@ export class AIHordeProvider extends BaseProvider {
       endpoint: 'models',
     });
     return this.validationResult(res);
+  }
+
+  /**
+   * Live worker-model listing off the keyless status/models endpoint. The
+   * stored apiKey is ignored — queue priority only applies to generations, and
+   * the status route answers without auth.
+   */
+  async listChatModels(_apiKey: string | null): Promise<DiscoveredModel[]> {
+    const res = await this.fetchWithTimeout('https://aihorde.net/api/v2/status/models', {
+      method: 'GET',
+    }, 30000, { timeoutBounds: 'request' });
+    recordQuotaObservationsFromResponse(res, {
+      platform: this.platform,
+      endpoint: 'models',
+    });
+
+    const bodyText = await readCappedBody(res);
+    if (!res.ok) {
+      throw new Error(`${this.name} model listing failed (HTTP ${res.status})`);
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(bodyText);
+    } catch {
+      throw new Error(`${this.name} model listing did not return JSON.`);
+    }
+    if (!hasModelList(payload)) {
+      throw new Error(`${this.name} model listing did not return a model list in a format this gateway understands.`);
+    }
+    const models = parseModelCatalog(payload);
+    if (models.length === 0) {
+      throw new Error(`${this.name} model listing returned no models.`);
+    }
+    return models;
   }
 }

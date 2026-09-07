@@ -3,6 +3,7 @@ import { BaseProvider } from '../../providers/base.js';
 import { OpenAICompatProvider } from '../../providers/openai-compat.js';
 import { GoogleProvider } from '../../providers/google.js';
 import { CohereProvider } from '../../providers/cohere.js';
+import { AIHordeProvider } from '../../providers/aihorde.js';
 import { getProvider } from '../../providers/index.js';
 import type {
   ChatCompletionResponse,
@@ -302,5 +303,56 @@ describe('CohereProvider.listChatModels', () => {
     } as unknown as Response));
 
     await expect(new CohereProvider().listChatModels('c-key')).rejects.toThrow(/HTTP 401/);
+  });
+});
+
+describe('AIHordeProvider.listChatModels', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('keyless-GETs status/models and maps the name array, ignoring the apiKey', async () => {
+    const captured: { url: string; headers: Record<string, string> } = { url: '', headers: {} };
+    vi.spyOn(global, 'fetch').mockImplementationOnce(async (url, init) => {
+      captured.url = String(url);
+      captured.headers = ((init as RequestInit)?.headers ?? {}) as Record<string, string>;
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        headers: new Headers(),
+        text: () => Promise.resolve(JSON.stringify([{ name: 'model-b' }, { name: 'model-a' }])),
+      } as unknown as Response;
+    });
+
+    const models = await new AIHordeProvider().listChatModels('some-key');
+
+    expect(captured.url).toBe('https://aihorde.net/api/v2/status/models');
+    expect(captured.headers).not.toHaveProperty('Authorization');
+    expect(models.map((m) => m.id)).toEqual(['model-a', 'model-b']);
+  });
+
+  it('throws on an empty array', async () => {
+    vi.spyOn(global, 'fetch').mockImplementationOnce(async () => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      headers: new Headers(),
+      text: () => Promise.resolve('[]'),
+    } as unknown as Response));
+
+    await expect(new AIHordeProvider().listChatModels(null)).rejects.toThrow(/no models/i);
+  });
+
+  it('throws on a non-ok response', async () => {
+    vi.spyOn(global, 'fetch').mockImplementationOnce(async () => ({
+      ok: false,
+      status: 503,
+      statusText: 'Unavailable',
+      headers: new Headers(),
+      text: () => Promise.resolve('down'),
+    } as unknown as Response));
+
+    await expect(new AIHordeProvider().listChatModels(null)).rejects.toThrow(/HTTP 503/);
   });
 });
