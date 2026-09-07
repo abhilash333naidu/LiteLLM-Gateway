@@ -409,3 +409,185 @@ describe('live-model-sync keyed collectors', () => {
     expect(row.enabled).toBe(1);
   });
 });
+
+function addLiveRow(platform: string, id: string, enabled = 1): number {
+  const info = getDb().prepare(`
+    INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled, source, endpoint_scope)
+    VALUES (?, ?, ?, 50, 50, 'Medium', ?, 'live', '')
+  `).run(platform, id, id, enabled);
+  const modelDbId = Number(info.lastInsertRowid);
+  getDb().prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, ?)').run(modelDbId, modelDbId, enabled);
+  const profile = getDb().prepare('SELECT id FROM profiles LIMIT 1').get() as { id: number } | undefined;
+  if (profile) {
+    getDb().prepare('INSERT INTO profile_models (profile_id, model_db_id, priority, enabled) VALUES (?, ?, ?, ?)').run(profile.id, modelDbId, modelDbId, enabled);
+  }
+  return modelDbId;
+}
+
+function tombstoneOf(platform: string, id: string): Record<string, unknown> | undefined {
+  return getDb().prepare("SELECT source, reason FROM catalog_model_tombstones WHERE kind = 'chat' AND platform = ? AND model_id = ?").get(platform, id) as
+    | Record<string, unknown>
+    | undefined;
+}
+
+describe('live-model-sync deprecation and reinstate', () => {
+  beforeEach(() => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    process.env.DEV_MODE = 'true';
+    process.env.NODE_ENV = 'test';
+    initDb(':memory:');
+    getDb().exec(
+      'DELETE FROM profile_models; DELETE FROM fallback_config; DELETE FROM api_keys; DELETE FROM models; DELETE FROM requests; DELETE FROM catalog_model_tombstones; DELETE FROM model_overrides;',
+    );
+    getDb().prepare("DELETE FROM settings WHERE key LIKE 'live_discovery_%'").run();
+    vi.clearAllMocks();
+    process.env.LIVE_MODEL_SYNC_INTERVAL_MS = '3600000';
+    process.env.LIVE_MODEL_SYNC_PLATFORMS = 'openrouter';
+  });
+
+  afterEach(() => {
+    delete process.env.LIVE_MODEL_SYNC_INTERVAL_MS;
+    delete process.env.LIVE_MODEL_SYNC_PLATFORMS;
+    vi.unstubAllGlobals();
+  });
+
+  it('deprecates live rows missing from a successful non-empty fetch', async () => {
+    const goneId = addLiveRow('openrouter', 'gone-model');
+    addLiveRow('openrouter', 'kept-model');
+    stubOpenRouterFetch({ data: [openRouterEntry({ id: 'kept-model' })] });
+
+    const result = await runLiveModelSync(getDb());
+    expect(result.ok).toBe(true);
+    expect(result.counts.deprecated).toBe(1);
+    const gone = getDb().prepare('SELECT enabled FROM models WHERE id = ?').get(goneId) as { enabled: number };
+    expect(gone.enabled).toBe(0);
+    expect((getDb().prepare('SELECT enabled FROM fallback_config WHERE model_db_id = ?').get(goneId) as { enabled: number }).enabled).toBe(0);
+    expect((getDb().prepare('SELECT enabled FROM profile_models WHERE model_db_id = ?').get(goneId) as { enabled: number }).enabled).toBe(0);
+    const tomb = tombstoneOf('openrouter', 'gone-model');
+    expect(tomb?.source).toBe('upstream_eol');
+    expect(String(tomb?.reason)).toMatch(/^live-sync: /);
+    const kept = getDb().prepare("SELECT enabled FROM models WHERE model_id = 'kept-model'").get() as { enabled: number };
+    expect(kept.enabled).toBe(1);
+  });
+
+  it('never deprecates non-live rows', async () => {
+    getDb().prepare(`
+      INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled, source, endpoint_scope)
+      VALUES ('openrouter', 'catalog-model', 'Catalog Model', 10, 5, 'Medium', 1, 'catalog', '')
+    `).run();
+    getDb().prepare(`
+      INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled, source, endpoint_scope)
+      VALUES ('openrouter', 'user-model', 'User Model', 10, 5, 'Medium', 1, 'user', '')
+    `).run();
+    stubOpenRouterFetch({ data: [openRouterEntry({ id: 'kept-model' })] });
+
+    const result = await runLiveModelSync(getDb());
+    expect(result.counts.deprecated).toBe(0);
+    for (const id of ['catalog-model', 'user-model']) {
+      const row = getDb().prepare('SELECT enabled FROM models WHERE model_id = ?').get(id) as { enabled: number };
+      expect(row.enabled).toBe(1);
+      expect(tombstoneOf('openrouter', id)).toBeUndefined();
+    }
+  });
+
+  it('a failed fetch deprecates nothing', async () => {
+    addLiveRow('openrouter', 'gone-model');
+    stubOpenRouterFetch({ error: 'down' }, 500);
+
+    const result = await runLiveModelSync(getDb());
+    expect(result.ok).toBe(false);
+    expect(result.counts.deprecated).toBe(0);
+    const row = getDb().prepare("SELECT enabled FROM models WHERE model_id = 'gone-model'").get() as { enabled: number };
+    expect(row.enabled).toBe(1);
+  });
+
+  it('never updates metadata of an existing non-live row', async () => {
+    getDb().prepare(`
+      INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
+        rpm_limit, rpd_limit, monthly_token_budget, context_window, enabled, supports_tools, supports_vision, source, endpoint_scope)
+      VALUES ('openrouter', 'shared-model', 'Operator Name', 99, 88, 'Large', 30, 1000, '~1M', 8192, 1, 0, 1, 'catalog', '')
+    `).run();
+    stubOpenRouterFetch({ data: [openRouterEntry({ id: 'shared-model' })] });
+
+    const result = await runLiveModelSync(getDb());
+    expect(result.counts.skipped).toBe(1);
+    expect(result.counts.added).toBe(0);
+    const row = getDb().prepare("SELECT * FROM models WHERE model_id = 'shared-model'").get() as Record<string, unknown>;
+    expect(row.display_name).toBe('Operator Name');
+    expect(row.intelligence_rank).toBe(99);
+    expect(row.speed_rank).toBe(88);
+    expect(row.rpm_limit).toBe(30);
+    expect(row.supports_tools).toBe(0);
+    expect(row.supports_vision).toBe(1);
+    expect(row.source).toBe('catalog');
+  });
+
+  it('never re-enables a user-disabled live row', async () => {
+    addLiveRow('openrouter', 'off-model', 0);
+    stubOpenRouterFetch({ data: [openRouterEntry({ id: 'off-model' })] });
+
+    const result = await runLiveModelSync(getDb());
+    expect(result.counts.reinstated).toBe(0);
+    expect(result.counts.skipped).toBe(1);
+    const row = getDb().prepare("SELECT enabled FROM models WHERE model_id = 'off-model'").get() as { enabled: number };
+    expect(row.enabled).toBe(0);
+  });
+
+  it('never re-adds a user-tombstoned model', async () => {
+    const { recordCatalogModelTombstone } = await import('../../services/model-state.js');
+    recordCatalogModelTombstone(getDb(), 'chat', 'openrouter', 'dead-model', { source: 'user', reason: 'deleted in dashboard' });
+    stubOpenRouterFetch({ data: [openRouterEntry({ id: 'dead-model' })] });
+
+    const result = await runLiveModelSync(getDb());
+    expect(result.counts.tombstoned).toBe(1);
+    expect(result.counts.added).toBe(0);
+    expect(liveRows()).toEqual([]);
+  });
+
+  it('re-listing reinstates only live-sync tombstones', async () => {
+    const reId = addLiveRow('openrouter', 'back-model', 0);
+    const { recordCatalogModelTombstone } = await import('../../services/model-state.js');
+    recordCatalogModelTombstone(getDb(), 'chat', 'openrouter', 'back-model', {
+      source: 'upstream_eol',
+      reason: 'live-sync: absent from provider list as of 2026-01-01T00:00:00.000Z',
+    });
+    stubOpenRouterFetch({ data: [openRouterEntry({ id: 'back-model' })] });
+
+    const result = await runLiveModelSync(getDb());
+    expect(result.counts.reinstated).toBe(1);
+    expect((getDb().prepare('SELECT enabled FROM models WHERE id = ?').get(reId) as { enabled: number }).enabled).toBe(1);
+    expect((getDb().prepare('SELECT enabled FROM fallback_config WHERE model_db_id = ?').get(reId) as { enabled: number }).enabled).toBe(1);
+    expect(tombstoneOf('openrouter', 'back-model')).toBeUndefined();
+  });
+
+  it('re-listing leaves 410-retirement tombstones alone', async () => {
+    const reId = addLiveRow('openrouter', 'retired-model', 0);
+    const { recordCatalogModelTombstone } = await import('../../services/model-state.js');
+    recordCatalogModelTombstone(getDb(), 'chat', 'openrouter', 'retired-model', {
+      source: 'upstream_eol',
+      reason: 'upstream reports it retired: 410 end of life',
+    });
+    stubOpenRouterFetch({ data: [openRouterEntry({ id: 'retired-model' })] });
+
+    const result = await runLiveModelSync(getDb());
+    expect(result.counts.reinstated).toBe(0);
+    expect((getDb().prepare('SELECT enabled FROM models WHERE id = ?').get(reId) as { enabled: number }).enabled).toBe(0);
+    expect(tombstoneOf('openrouter', 'retired-model')?.reason).toBe('upstream reports it retired: 410 end of life');
+  });
+
+  it('re-listing respects a model_overrides pin on enabled', async () => {
+    const reId = addLiveRow('openrouter', 'pinned-model', 0);
+    const { recordCatalogModelTombstone, upsertModelOverrides } = await import('../../services/model-state.js');
+    recordCatalogModelTombstone(getDb(), 'chat', 'openrouter', 'pinned-model', {
+      source: 'upstream_eol',
+      reason: 'live-sync: absent from provider list as of 2026-01-01T00:00:00.000Z',
+    });
+    upsertModelOverrides(getDb(), 'openrouter', 'pinned-model', { enabled: false });
+    stubOpenRouterFetch({ data: [openRouterEntry({ id: 'pinned-model' })] });
+
+    const result = await runLiveModelSync(getDb());
+    expect(result.counts.reinstated).toBe(0);
+    expect((getDb().prepare('SELECT enabled FROM models WHERE id = ?').get(reId) as { enabled: number }).enabled).toBe(0);
+    expect(tombstoneOf('openrouter', 'pinned-model')?.source).toBe('upstream_eol');
+  });
+});

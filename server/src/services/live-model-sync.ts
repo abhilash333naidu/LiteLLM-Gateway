@@ -5,7 +5,13 @@ import type { Scheduler } from '../lib/scheduler.js';
 import { MAX_DISCOVERED_MODELS, hasModelList, parseModelCatalog, readCappedBody } from './model-discovery.js';
 import { customModelSeed } from './custom-model-seed.js';
 import { ensureModelInProfiles } from './profile-models.js';
-import { isCatalogModelTombstoned } from './model-state.js';
+import {
+  clearCatalogModelTombstone,
+  getCatalogModelTombstone,
+  getModelOverrides,
+  isCatalogModelTombstoned,
+  recordCatalogModelTombstone,
+} from './model-state.js';
 import { getProvider } from '../providers/index.js';
 import { OpenAICompatProvider } from '../providers/openai-compat.js';
 import { decrypt } from '../lib/crypto.js';
@@ -348,16 +354,44 @@ interface ExistingRow {
   enabled: number;
 }
 
-/** Apply one platform roster: add unseen ids, never touch existing rows'
- *  metadata, never re-add a user-tombstoned model. One transaction. */
+/** Re-listed after a live-sync deprecation: lift the tombstone and re-enable
+ *  the row, its fallback chain entry and its profile entries — unless a stored
+ *  override pins enabled off, or the tombstone is not ours (410-retirements
+ *  from model-retirement.ts carry different reason text and are never
+ *  touched). Only live-sync tombstones (`live-sync:` reason prefix) qualify. */
+function maybeReinstateLiveModel(
+  db: Db,
+  platform: string,
+  modelId: string,
+  row: ExistingRow,
+  counts: LiveDiscoveryCounts,
+): boolean {
+  if (row.source !== 'live' || row.enabled === 1) return false;
+  const tomb = getCatalogModelTombstone(db, 'chat', platform, modelId);
+  if (!tomb || tomb.source !== 'upstream_eol') return false;
+  if (!tomb.reason || !tomb.reason.startsWith('live-sync:')) return false;
+  if (getModelOverrides(db, platform, modelId).enabled === false) return false;
+  clearCatalogModelTombstone(db, 'chat', platform, modelId);
+  db.prepare('UPDATE models SET enabled = 1 WHERE id = ?').run(row.id);
+  db.prepare('UPDATE fallback_config SET enabled = 1 WHERE model_db_id = ?').run(row.id);
+  db.prepare('UPDATE profile_models SET enabled = 1 WHERE model_db_id = ?').run(row.id);
+  counts.reinstated += 1;
+  return true;
+}
+
+/** Apply one platform roster: add unseen ids, reinstate re-listed live-sync
+ *  deprecations, never touch existing rows' metadata otherwise, and never
+ *  re-add a user-tombstoned model. One transaction. */
 function applyPlatformModels(db: Db, platform: string, models: CollectedLiveModel[], counts: LiveDiscoveryCounts): void {
   db.transaction(() => {
     const existing = db.prepare('SELECT id, model_id, source, enabled FROM models WHERE platform = ?').all(platform) as ExistingRow[];
     const byId = new Map(existing.map(row => [row.model_id, row]));
     for (const model of models) {
-      if (byId.has(model.id)) {
-        // Present already — a local disable, a catalog row, a user row: all win.
-        counts.skipped += 1;
+      const row = byId.get(model.id);
+      if (row) {
+        // Present already — a local disable, a catalog row, a user row: all
+        // win, except a live-sync deprecation the provider just undid.
+        if (!maybeReinstateLiveModel(db, platform, model.id, row, counts)) counts.skipped += 1;
         continue;
       }
       if (isCatalogModelTombstoned(db, 'chat', platform, model.id)) {
@@ -367,6 +401,29 @@ function applyPlatformModels(db: Db, platform: string, models: CollectedLiveMode
       insertLiveModelRow(db, platform, model);
       byId.set(model.id, { id: -1, model_id: model.id, source: 'live', enabled: 1 });
       counts.added += 1;
+    }
+  })();
+}
+
+/** Deprecate live rows a successful non-empty provider fetch omits: disable
+ *  the row plus its fallback/profile entries and record an upstream_eol
+ *  tombstone. Only rows this service created (source='live'), only rows with
+ *  no tombstone at all — 410-retirements and user deletions are never
+ *  touched, and tombstones are never written for models we did not create. */
+function deprecateMissingLiveModels(db: Db, platform: string, seenIds: Set<string>, counts: LiveDiscoveryCounts): void {
+  db.transaction(() => {
+    const rows = db.prepare(
+      "SELECT id, model_id FROM models WHERE platform = ? AND source = 'live' AND enabled = 1",
+    ).all(platform) as Array<{ id: number; model_id: string }>;
+    for (const row of rows) {
+      if (seenIds.has(row.model_id)) continue;
+      if (getCatalogModelTombstone(db, 'chat', platform, row.model_id)) continue;
+      const reason = 'live-sync: absent from provider list as of ' + new Date().toISOString();
+      recordCatalogModelTombstone(db, 'chat', platform, row.model_id, { source: 'upstream_eol', reason });
+      db.prepare('UPDATE models SET enabled = 0 WHERE id = ?').run(row.id);
+      db.prepare('UPDATE fallback_config SET enabled = 0 WHERE model_db_id = ?').run(row.id);
+      db.prepare('UPDATE profile_models SET enabled = 0 WHERE model_db_id = ?').run(row.id);
+      counts.deprecated += 1;
     }
   })();
 }
@@ -412,6 +469,7 @@ export async function runLiveModelSync(db: Db): Promise<LiveDiscoveryResult> {
         if (out.models.length === 0) throw new Error(platform + ' returned an empty model list');
         seen[platform] = out.models.map(m => m.id);
         applyPlatformModels(db, platform, out.models, counts);
+        deprecateMissingLiveModels(db, platform, new Set(seen[platform]), counts);
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         failures.push({ platform, error: message });
