@@ -9,6 +9,7 @@ import { extendedBodyParams, resolveMaxTokens } from '../lib/sampling-params.js'
 import { flattenMessageContent } from '../lib/content.js';
 import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
 import { stripSchemaKeys } from '../lib/tool-args.js';
+import { MAX_DISCOVERED_MODELS, readCappedBody, type DiscoveredModel } from '../services/model-discovery.js';
 
 const API_BASE = 'https://api.cohere.ai/compatibility/v1';
 
@@ -144,5 +145,59 @@ export class CohereProvider extends BaseProvider {
       endpoint: 'models',
     });
     return this.validationResult(res);
+  }
+
+  /**
+   * Live chat-model listing off GET <API_BASE>/models with the same Bearer
+   * header validateKey uses. Keeps entries with no `endpoints` field or whose
+   * endpoints (case-insensitive) include 'chat' or 'generate' — embed/rerank
+   * -only rows are dropped.
+   */
+  async listChatModels(apiKey: string | null): Promise<DiscoveredModel[]> {
+    const headers: Record<string, string> = {};
+    if (apiKey != null) headers['Authorization'] = `Bearer ${apiKey}`;
+    const res = await this.fetchWithTimeout(`${API_BASE}/models`, {
+      method: 'GET',
+      headers,
+    }, 30000, { timeoutBounds: 'request' });
+    recordQuotaObservationsFromResponse(res, {
+      platform: this.platform,
+      endpoint: 'models',
+    });
+
+    const bodyText = await readCappedBody(res);
+    if (!res.ok) {
+      throw new Error(`${this.name} model listing failed (HTTP ${res.status})`);
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(bodyText);
+    } catch {
+      throw new Error(`${this.name} model listing did not return JSON.`);
+    }
+    const entries = (payload as { models?: unknown })?.models;
+    if (!Array.isArray(entries)) {
+      throw new Error(`${this.name} model listing did not return a model list in a format this gateway understands.`);
+    }
+    const models: DiscoveredModel[] = [];
+    for (const entry of entries) {
+      if (!entry || typeof entry !== 'object') continue;
+      const record = entry as { name?: unknown; endpoints?: unknown };
+      if (typeof record.name !== 'string' || record.name.trim().length === 0) continue;
+      if (record.endpoints !== undefined) {
+        const endpoints = Array.isArray(record.endpoints) ? record.endpoints : [record.endpoints];
+        const chatCapable = endpoints.some(
+          (e) => typeof e === 'string' && /chat|generate/i.test(e),
+        );
+        if (!chatCapable) continue;
+      }
+      models.push({ id: record.name.trim(), ownedBy: null });
+    }
+    if (models.length === 0) {
+      throw new Error(`${this.name} model listing returned no models.`);
+    }
+    return models
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .slice(0, MAX_DISCOVERED_MODELS);
   }
 }

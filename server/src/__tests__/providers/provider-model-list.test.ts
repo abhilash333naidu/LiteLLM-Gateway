@@ -2,6 +2,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { BaseProvider } from '../../providers/base.js';
 import { OpenAICompatProvider } from '../../providers/openai-compat.js';
 import { GoogleProvider } from '../../providers/google.js';
+import { CohereProvider } from '../../providers/cohere.js';
 import { getProvider } from '../../providers/index.js';
 import type {
   ChatCompletionResponse,
@@ -240,5 +241,66 @@ describe('GoogleProvider.listChatModels', () => {
     mockGoogle('denied', { ok: false, status: 400 });
 
     await expect(new GoogleProvider().listChatModels('g-key')).rejects.toThrow(/HTTP 400/);
+  });
+});
+
+describe('CohereProvider.listChatModels', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('keeps chat/generate entries plus endpoint-less ones, drops embed-only', async () => {
+    const captured: { url: string; headers: Record<string, string> } = { url: '', headers: {} };
+    vi.spyOn(global, 'fetch').mockImplementationOnce(async (url, init) => {
+      captured.url = String(url);
+      captured.headers = ((init as RequestInit)?.headers ?? {}) as Record<string, string>;
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        headers: new Headers(),
+        text: () =>
+          Promise.resolve(
+            JSON.stringify({
+              models: [
+                { name: 'command-r', endpoints: ['chat'] },
+                { name: 'command-gen', endpoints: ['Generate'] },
+                { name: 'command-bare' },
+                { name: 'embed-x', endpoints: ['embed'] },
+              ],
+            }),
+          ),
+      } as unknown as Response;
+    });
+
+    const models = await new CohereProvider().listChatModels('c-key');
+
+    expect(captured.url).toBe('https://api.cohere.ai/compatibility/v1/models');
+    expect(captured.headers['Authorization']).toBe('Bearer c-key');
+    expect(models.map((m) => m.id)).toEqual(['command-bare', 'command-gen', 'command-r']);
+  });
+
+  it('throws when nothing chat-capable remains', async () => {
+    vi.spyOn(global, 'fetch').mockImplementationOnce(async () => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      headers: new Headers(),
+      text: () => Promise.resolve(JSON.stringify({ models: [{ name: 'embed-x', endpoints: ['embed'] }] })),
+    } as unknown as Response));
+
+    await expect(new CohereProvider().listChatModels('c-key')).rejects.toThrow(/no models/i);
+  });
+
+  it('throws on a non-ok response', async () => {
+    vi.spyOn(global, 'fetch').mockImplementationOnce(async () => ({
+      ok: false,
+      status: 401,
+      statusText: 'Unauthorized',
+      headers: new Headers(),
+      text: () => Promise.resolve('denied'),
+    } as unknown as Response));
+
+    await expect(new CohereProvider().listChatModels('c-key')).rejects.toThrow(/HTTP 401/);
   });
 });
