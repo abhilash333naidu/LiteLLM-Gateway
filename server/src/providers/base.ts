@@ -8,6 +8,7 @@ import type {
 } from '@freellmapi/shared/types.js';
 import type { QuotaObservationContext } from '../services/provider-quota.js';
 import type { ExtendedSamplingOptions } from '../lib/sampling-params.js';
+import type { DiscoveredModel } from '../services/model-discovery.js';
 import { proxyFetch } from '../lib/proxy.js';
 import { providerTimeoutMs, streamStallTimeoutMs } from '../lib/provider-timeout.js';
 import { extractThinkTagsFromStream } from '../lib/think-tags.js';
@@ -240,6 +241,16 @@ export abstract class BaseProvider {
   ): AsyncGenerator<ChatCompletionChunk>;
 
   abstract validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<KeyValidationResult>;
+
+  /**
+   * Live chat-model listing for providers that expose a catalog endpoint.
+   * The default throws — subclasses with a known listing route override it.
+   * A null apiKey means "no credential": overrides must omit the Authorization
+   * header entirely rather than send a bare/null bearer.
+   */
+  async listChatModels(_apiKey: string | null): Promise<DiscoveredModel[]> {
+    throw new Error(`model listing not supported for ${this.platform}`);
+  }
 
   /**
    * Turn a conventional 401/403 validation response into a diagnostic result.
