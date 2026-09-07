@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { BaseProvider } from '../../providers/base.js';
 import { OpenAICompatProvider } from '../../providers/openai-compat.js';
+import { GoogleProvider } from '../../providers/google.js';
 import { getProvider } from '../../providers/index.js';
 import type {
   ChatCompletionResponse,
@@ -178,5 +179,66 @@ describe('kilo registration', () => {
 
     expect(capturedUrl).toBe('https://api.kilo.ai/api/gateway/models');
     expect(models.map((m) => m.id)).toEqual(['kilo-model']);
+  });
+});
+
+describe('GoogleProvider.listChatModels', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function mockGoogle(bodyText: string, opts?: { ok?: boolean; status?: number }) {
+    const captured: { url: string; headers: Record<string, string> } = { url: '', headers: {} };
+    vi.spyOn(global, 'fetch').mockImplementationOnce(async (url, init) => {
+      captured.url = String(url);
+      captured.headers = ((init as RequestInit)?.headers ?? {}) as Record<string, string>;
+      return {
+        ok: opts?.ok ?? true,
+        status: opts?.status ?? 200,
+        statusText: 'Status',
+        headers: new Headers(),
+        text: () => Promise.resolve(bodyText),
+      } as unknown as Response;
+    });
+    return captured;
+  }
+
+  const googleBody = JSON.stringify({
+    models: [
+      {
+        name: 'models/gemini-2.0-flash',
+        displayName: 'Gemini 2.0 Flash',
+        supportedGenerationMethods: ['generateContent', 'countTokens'],
+      },
+      { name: 'models/embedding-001', supportedGenerationMethods: ['embedContent'] },
+      { name: 'models/no-methods', displayName: 'No Methods' },
+    ],
+  });
+
+  it('keeps generateContent entries, strips the models/ prefix, maps displayName', async () => {
+    const captured = mockGoogle(googleBody);
+
+    const models = await new GoogleProvider().listChatModels('g-key');
+
+    expect(captured.url).toBe('https://generativelanguage.googleapis.com/v1beta/models');
+    expect(captured.headers['x-goog-api-key']).toBe('g-key');
+    expect(models.map((m) => m.id)).toEqual(['gemini-2.0-flash']);
+    expect(models[0].ownedBy).toBe('Gemini 2.0 Flash');
+    expect(models[0].contextWindow).toBeUndefined();
+    expect(models[0].vision).toBeUndefined();
+  });
+
+  it('throws when nothing supports generateContent', async () => {
+    mockGoogle(JSON.stringify({
+      models: [{ name: 'models/embedding-001', supportedGenerationMethods: ['embedContent'] }],
+    }));
+
+    await expect(new GoogleProvider().listChatModels('g-key')).rejects.toThrow(/no models/i);
+  });
+
+  it('throws on a non-ok response', async () => {
+    mockGoogle('denied', { ok: false, status: 400 });
+
+    await expect(new GoogleProvider().listChatModels('g-key')).rejects.toThrow(/HTTP 400/);
   });
 });

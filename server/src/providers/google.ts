@@ -12,6 +12,7 @@ import { contentToString } from '../lib/content.js';
 import { proxyFetch } from '../lib/proxy.js';
 import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
 import { providerTimeoutMs, streamStallTimeoutMs } from '../lib/provider-timeout.js';
+import { MAX_DISCOVERED_MODELS, readCappedBody, type DiscoveredModel } from '../services/model-discovery.js';
 import { sanitizeForGemini } from '../lib/gemini-wire.js';
 import { resolveMaxTokens } from '../lib/sampling-params.js';
 
@@ -872,5 +873,66 @@ export class GoogleProvider extends BaseProvider {
       `Google key validation inconclusive (HTTP ${res.status}${gStatus ? ` ${gStatus}` : ''}${reason ? ` ${reason}` : ''})` +
       `${message ? `: ${message}` : ''}`,
     );
+  }
+
+  /**
+   * Live chat-model listing off GET ${API_BASE}/models with the same
+   * x-goog-api-key header validateKey uses. Keeps only entries that support
+   * generateContent (embedders and other non-chat models are dropped), strips
+   * the `models/` id prefix, and maps displayName onto ownedBy.
+   */
+  async listChatModels(apiKey: string | null): Promise<DiscoveredModel[]> {
+    const res = await this.fetchWithTimeout(
+      `${API_BASE}/models`,
+      {
+        method: 'GET',
+        headers: apiKey != null ? { 'x-goog-api-key': apiKey } : {},
+      },
+      30000,
+      { timeoutBounds: 'request' },
+    );
+    recordQuotaObservationsFromResponse(res, {
+      platform: this.platform,
+      endpoint: 'models',
+    });
+
+    const bodyText = await readCappedBody(res);
+    if (!res.ok) {
+      throw new Error(`${this.name} model listing failed (HTTP ${res.status})`);
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(bodyText);
+    } catch {
+      throw new Error(`${this.name} model listing did not return JSON.`);
+    }
+    const entries = (payload as { models?: unknown })?.models;
+    if (!Array.isArray(entries)) {
+      throw new Error(`${this.name} model listing did not return a model list in a format this gateway understands.`);
+    }
+    const models: DiscoveredModel[] = [];
+    for (const entry of entries) {
+      if (!entry || typeof entry !== 'object') continue;
+      const record = entry as { name?: unknown; displayName?: unknown; supportedGenerationMethods?: unknown };
+      if (typeof record.name !== 'string' || record.name.trim().length === 0) continue;
+      const methods = Array.isArray(record.supportedGenerationMethods)
+        ? record.supportedGenerationMethods
+        : [];
+      if (!methods.some((m) => m === 'generateContent')) continue;
+      const id = record.name.replace(/^models\//, '');
+      models.push({
+        id,
+        ownedBy:
+          typeof record.displayName === 'string' && record.displayName.trim().length > 0
+            ? record.displayName.trim()
+            : null,
+      });
+    }
+    if (models.length === 0) {
+      throw new Error(`${this.name} model listing returned no models.`);
+    }
+    return models
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .slice(0, MAX_DISCOVERED_MODELS);
   }
 }
