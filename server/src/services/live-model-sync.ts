@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import type { Db } from '../db/types.js';
 import { getDb, getSetting, setSetting } from '../db/index.js';
 import type { Scheduler } from '../lib/scheduler.js';
-import { MAX_DISCOVERED_MODELS, hasModelList, parseModelCatalog, readCappedBody } from './model-discovery.js';
+import { MAX_DISCOVERED_MODELS, readCappedBody } from './model-discovery.js';
 import { customModelSeed } from './custom-model-seed.js';
 import { ensureModelInProfiles } from './profile-models.js';
 import {
@@ -13,7 +13,7 @@ import {
   recordCatalogModelTombstone,
 } from './model-state.js';
 import { getProvider } from '../providers/index.js';
-import { OpenAICompatProvider } from '../providers/openai-compat.js';
+import { BaseProvider } from '../providers/base.js';
 import { decrypt } from '../lib/crypto.js';
 import { decryptProxyUrl } from '../lib/key-proxy.js';
 import { withKeyProxy } from '../lib/proxy.js';
@@ -64,7 +64,16 @@ export interface CollectedLiveModel {
 const DEFAULT_INTERVAL_MS = 12 * 60 * 60 * 1000;
 
 /** Keyless OpenRouter plus the keyed free-tier gateways, in fetch order. */
-const DEFAULT_PLATFORMS = ['openrouter', 'opencode', 'groq'];
+const DEFAULT_PLATFORMS = [
+  'openrouter',
+  'opencode', 'groq',
+  'routeway', 'unorouter', 'orcarouter', 'bazaarlink',
+  'kilo', 'pollinations',
+  'reka', 'nara', 'agnes',
+  'sealion', 'llm7', 'navy', 'cerebras', 'github', 'nvidia',
+  'mistral', 'ovh', 'aion', 'ainative', 'anyapi',
+  'google', 'cohere', 'aihorde', 'cloudflare',
+];
 
 const SETTING_LAST_RUN_MS = 'live_discovery_last_run_ms';
 const SETTING_LAST_ERROR = 'live_discovery_last_error';
@@ -244,60 +253,155 @@ async function fetchOpenRouterModels(): Promise<CollectorOutput> {
   return { models, paidSkipped };
 }
 
-/** Keyed free-tier gateway roster. Only OpenAI-compatible providers that expose
- *  fetchModelCatalog qualify (google/cohere/cloudflare/aihorde and any other
- *  class are skipped), and only when at least one enabled healthy-or-unknown
- *  key exists — one platform's failure is isolated and never disables rows. */
-async function fetchKeyedPlatformModels(db: Db, platform: string): Promise<CollectorOutput> {
-  const notAttempted: CollectorOutput = { models: [], paidSkipped: 0, notAttempted: true };
-  const provider = getProvider(platform as Platform);
-  if (!(provider instanceof OpenAICompatProvider) || typeof provider.fetchModelCatalog !== 'function') {
-    return notAttempted;
-  }
-  const keyRow = db.prepare(
+/** Free-tier probe rules: platform → id patterns that count as free.
+ *  `'*'` matches any run of chars (incl. empty), so `'*'` alone admits all
+ *  served ids. A platform with NO entry here is never probed — unknown env
+ *  names skip silently, and the EXCLUDED set below stays out on purpose. */
+interface LiveProbeRule {
+  patterns: string[];
+  /** Keyless probes call listChatModels(null) with NO key lookup. */
+  keyless?: boolean;
+}
+
+const LIVE_PROBE_RULES: Record<string, LiveProbeRule> = {
+  // OpenCode Zen free promo pool: `-free` suffixed ids plus the free flagship.
+  opencode: { patterns: ['*-free', 'big-pickle'] },
+  // Groq: everything servable on the key is free-tier.
+  groq: { patterns: ['*'] },
+  // Routeway / UnoRouter aggregators: free pool carries the `:free` suffix.
+  routeway: { patterns: ['*:free'] },
+  unorouter: { patterns: ['*:free'] },
+  // OrcaRouter: recurring rate-limited free aliases, never paid fallback.
+  orcarouter: { patterns: ['*-free', 'orcarouter/free'] },
+  // BazaarLink: only the `auto:free` route is $0; direct ids are paid.
+  bazaarlink: { patterns: ['auto:free'] },
+  // Kilo: its /v1/models 405s; the list URL is wired separately — this code
+  // just calls listChatModels and treats throw/empty as inconclusive.
+  kilo: { patterns: ['*:free'], keyless: true },
+  // Pollinations: public /v1/models, no key needed.
+  pollinations: { patterns: ['*'], keyless: true },
+  // Reka: exactly the two /v1/models entries (recurring monthly credit grant).
+  reka: { patterns: ['reka-flash-3', 'reka-edge-2603'] },
+  // NaraRouter: the three free-plan routes.
+  nara: { patterns: ['mistral-large', 'mistral-medium-3-5', 'tencent-hy3'] },
+  // Agnes AI: no agnes rows exist in the legacy baseline seed, so there are no
+  // exact ids to derive — match the proprietary `agnes-` prefix instead (only
+  // evidenced id so far: agnes-2.0-flash, $0/token live-probed).
+  agnes: { patterns: ['agnes-*'] },
+  // First-party free tiers / free allowances already treated as free by the
+  // shipped catalog: admit everything served.
+  sealion: { patterns: ['*'] },
+  llm7: { patterns: ['*'] },
+  navy: { patterns: ['*'] },
+  cerebras: { patterns: ['*'] },
+  github: { patterns: ['*'] },
+  nvidia: { patterns: ['*'] },
+  mistral: { patterns: ['*'] },
+  ovh: { patterns: ['*'] },
+  aion: { patterns: ['*'] },
+  ainative: { patterns: ['*'] },
+  anyapi: { patterns: ['*'] },
+  // Adapters land in parallel; the listChatModels guard skips these until
+  // their provider exposes the method.
+  google: { patterns: ['*'] },
+  cohere: { patterns: ['*'] },
+  aihorde: { patterns: ['*'] },
+  cloudflare: { patterns: ['*'] },
+};
+// Explicitly EXCLUDED (no rule above), each for a wallet-safety reason:
+// - huggingface: hundreds of paid models, $0.10 shared credit, no free signal.
+// - modelscope: public list, retired-model 429 poison.
+// - zhipu, requesty, siliconflow, xkiro: free only distinguishable by probing.
+// - qianfan, volcengine, longcat, xfyun: real-name-gated, no operator keys.
+
+/** One provider roster entry from the listChatModels contract (parallel-agent
+ *  surface: BaseProvider default throws; OpenAICompatProvider + google/cohere/
+ *  aihorde/cloudflare overrides serve it). Fields are validated defensively —
+ *  anything unparseable is skipped, never stored. */
+interface ListedChatModel {
+  id: string;
+  tools?: boolean | undefined;
+  vision?: boolean | undefined;
+  contextWindow?: number | undefined;
+}
+
+type ListChatModelsFn = (apiKey: string | null) => Promise<ListedChatModel[]>;
+
+interface KeyRow {
+  encrypted_key: string;
+  iv: string;
+  auth_tag: string;
+  proxy_encrypted?: string | null;
+  proxy_iv?: string | null;
+  proxy_auth_tag?: string | null;
+  [column: string]: unknown;
+}
+
+function findUsableKeyRow(db: Db, platform: string): KeyRow | undefined {
+  return db.prepare(
     "SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy','unknown') ORDER BY id ASC LIMIT 1",
-  ).get(platform) as
-    | { encrypted_key: string; iv: string; auth_tag: string; [column: string]: unknown }
-    | undefined;
-  if (!keyRow) return notAttempted;
+  ).get(platform) as KeyRow | undefined;
+}
 
-  let apiKey: string;
-  try {
-    apiKey = decrypt(keyRow.encrypted_key, keyRow.iv, keyRow.auth_tag);
-  } catch (err: unknown) {
-    throw new Error(platform + ' stored key could not be decrypted');
-  }
-
-  let res: Response;
-  try {
+/** listChatModels collector. Keyless rules probe with a null key and NO key
+ *  lookup; keyed rules decrypt the stored credential first. A throw or an
+ *  empty/unparseable roster is inconclusive — the caller records a failure and
+ *  never disables rows. */
+async function fetchViaListChatModels(
+  db: Db,
+  platform: string,
+  rule: LiveProbeRule,
+  provider: object,
+  listChatModels: ListChatModelsFn,
+): Promise<CollectorOutput> {
+  const notAttempted: CollectorOutput = { models: [], paidSkipped: 0, notAttempted: true };
+  let apiKey: string | null = null;
+  let proxyRow: { proxy_encrypted: string | null; proxy_iv: string | null; proxy_auth_tag: string | null } | undefined;
+  if (!rule.keyless) {
+    const keyRow = findUsableKeyRow(db, platform);
+    if (!keyRow) return notAttempted;
+    try {
+      apiKey = decrypt(keyRow.encrypted_key, keyRow.iv, keyRow.auth_tag);
+    } catch {
+      throw new Error(platform + ' stored key could not be decrypted');
+    }
     // Mirror health.ts: probe through the key's own proxy exit.
-    const proxyRow = {
+    proxyRow = {
       proxy_encrypted: (keyRow.proxy_encrypted as string | null) ?? null,
       proxy_iv: (keyRow.proxy_iv as string | null) ?? null,
       proxy_auth_tag: (keyRow.proxy_auth_tag as string | null) ?? null,
     };
-    res = await withKeyProxy(decryptProxyUrl(proxyRow), () => provider.fetchModelCatalog(apiKey));
+  }
+
+  let discovered: unknown;
+  try {
+    discovered = await withKeyProxy(
+      proxyRow ? decryptProxyUrl(proxyRow) : undefined,
+      () => listChatModels.call(provider, apiKey),
+    );
   } catch (err: unknown) {
     const reason = err instanceof Error ? err.message : String(err);
-    throw new Error(platform + ' /models unreachable: ' + reason);
+    throw new Error(platform + ' listChatModels unreachable: ' + reason);
   }
-  const bodyText = await readCappedBody(res);
-  if (!res.ok) throw new Error(platform + ' /models returned HTTP ' + res.status);
-  let payload: unknown;
-  try {
-    payload = JSON.parse(bodyText);
-  } catch {
-    throw new Error(platform + ' /models did not return JSON');
+  if (!Array.isArray(discovered)) throw new Error(platform + ' listChatModels did not return a model list');
+  const entries: ListedChatModel[] = [];
+  for (const item of discovered) {
+    const record = asRecord(item);
+    const id = record && typeof record.id === 'string' ? record.id.trim() : '';
+    if (!id || id.length > MAX_MODEL_ID_LENGTH) continue;
+    entries.push({ id });
   }
-  if (!hasModelList(payload)) throw new Error(platform + ' /models did not return a model list');
-  const discovered = parseModelCatalog(payload);
-  if (discovered.length === 0) throw new Error(platform + ' returned an empty model list');
+  if (entries.length === 0) throw new Error(platform + ' returned an empty model list');
 
-  // Per-platform free filters: opencode serves `*-free` ids plus big-pickle,
-  // groq serves everything on the key. Anything else is presumably paid.
+  return filterFreeModels(platform, entries);
+}
+
+/** Apply the platform's LIVE_PROBE_RULES patterns; non-matching ids are
+ *  presumably paid and counted, never stored. */
+function filterFreeModels(platform: string, entries: ListedChatModel[]): CollectorOutput {
   const models: CollectedLiveModel[] = [];
   let paidSkipped = 0;
-  for (const entry of discovered) {
+  for (const entry of entries) {
     if (!liveFreePass(platform, entry.id)) {
       paidSkipped += 1;
       continue;
@@ -307,11 +411,40 @@ async function fetchKeyedPlatformModels(db: Db, platform: string): Promise<Colle
   return { models, paidSkipped };
 }
 
-/** Whether a keyed roster id counts as free on this platform. */
+/** Keyed free-tier gateway roster. Platforms with no LIVE_PROBE_RULES entry
+ *  (unknown env names, deliberately excluded wallets) skip silently — not a
+ *  failure. Probing goes through the provider's listChatModels override only:
+ *  the typeof guard plus the BaseProvider-default check skip providers whose
+ *  adapter has not landed yet. One platform's failure is isolated and never
+ *  disables rows. */
+async function fetchKeyedPlatformModels(db: Db, platform: string): Promise<CollectorOutput> {
+  const notAttempted: CollectorOutput = { models: [], paidSkipped: 0, notAttempted: true };
+  const rule = LIVE_PROBE_RULES[platform];
+  if (!rule) return notAttempted;
+  let provider: unknown;
+  try {
+    provider = getProvider(platform as Platform);
+  } catch {
+    return notAttempted;
+  }
+  const listChatModels = (provider as { listChatModels?: unknown }).listChatModels;
+  // The typeof guard alone is not enough: BaseProvider ships a default
+  // listChatModels that always throws ("model listing not supported"), so a
+  // provider that merely inherits it counts as ABSENT. Only a subclass
+  // override (or a test double's own function) takes the listing path.
+  const hasListing = typeof listChatModels === 'function'
+    && listChatModels !== BaseProvider.prototype.listChatModels;
+  if (!hasListing) return notAttempted;
+  return fetchViaListChatModels(db, platform, rule, provider as object, listChatModels as ListChatModelsFn);
+}
+
+/** Whether a roster id counts as free on this platform. Unknown platforms
+ *  (no rule) never pass — but they never reach here either, the collector
+ *  skips them before probing. */
 function liveFreePass(platform: string, id: string): boolean {
-  if (platform === 'groq') return true;
-  if (platform === 'opencode') return id === 'big-pickle' || livePatternMatches('*-free', id);
-  return false;
+  const rule = LIVE_PROBE_RULES[platform];
+  if (!rule) return false;
+  return rule.patterns.some(pattern => livePatternMatches(pattern, id));
 }
 
 /** Glob match where `*` matches any run of chars (incl. empty). */

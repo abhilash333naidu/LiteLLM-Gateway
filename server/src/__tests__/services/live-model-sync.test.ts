@@ -10,7 +10,7 @@ import { getProvider } from '../../providers/index.js';
 import { OpenAICompatProvider } from '../../providers/openai-compat.js';
 import { decrypt } from '../../lib/crypto.js';
 
-// The sync talks to keyed providers ONLY through getProvider + fetchModelCatalog;
+// The sync talks to keyed providers ONLY through getProvider + listChatModels;
 // stub the registry edge so each test controls what a platform "serves".
 vi.mock('../../providers/index.js', async () => {
   const actual = await vi.importActual('../../providers/index.js');
@@ -285,10 +285,10 @@ function addApiKey(platform: string, status = 'healthy', enabled = 1): void {
   `).run(platform, status, enabled);
 }
 
-function keyedProviderServing(ids: string[], status = 200): { provider: OpenAICompatProvider; catalog: ReturnType<typeof vi.fn> } {
+function keyedProviderServing(ids: string[]): { provider: OpenAICompatProvider; catalog: ReturnType<typeof vi.fn> } {
   const provider = new OpenAICompatProvider({ platform: 'opencode', name: 'OpenCode Zen', baseUrl: 'https://opencode.ai/zen/v1' });
-  const catalog = vi.spyOn(provider, 'fetchModelCatalog')
-    .mockResolvedValue(new Response(JSON.stringify({ data: ids.map(id => ({ id })) }), { status }));
+  const catalog = vi.spyOn(provider, 'listChatModels')
+    .mockResolvedValue(ids.map(id => ({ id, ownedBy: null })));
   return { provider, catalog };
 }
 
@@ -331,8 +331,8 @@ describe('live-model-sync keyed collectors', () => {
     process.env.LIVE_MODEL_SYNC_PLATFORMS = 'groq';
     addApiKey('groq', 'unknown');
     const groq = new OpenAICompatProvider({ platform: 'groq', name: 'Groq', baseUrl: 'https://api.groq.com/openai/v1' });
-    vi.spyOn(groq, 'fetchModelCatalog')
-      .mockResolvedValue(new Response(JSON.stringify({ data: [{ id: 'llama-3.3-70b-versatile' }, { id: 'paid-pro' }] }), { status: 200 }));
+    vi.spyOn(groq, 'listChatModels')
+      .mockResolvedValue([{ id: 'llama-3.3-70b-versatile', ownedBy: null }, { id: 'paid-pro', ownedBy: null }]);
     (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(groq);
 
     const result = await runLiveModelSync(getDb());
@@ -378,7 +378,7 @@ describe('live-model-sync keyed collectors', () => {
   it('a keyed 401 is recorded and never disables existing rows', async () => {
     addApiKey('opencode');
     const provider = new OpenAICompatProvider({ platform: 'opencode', name: 'OpenCode Zen', baseUrl: 'https://opencode.ai/zen/v1' });
-    vi.spyOn(provider, 'fetchModelCatalog').mockResolvedValue(new Response('denied', { status: 401 }));
+    vi.spyOn(provider, 'listChatModels').mockRejectedValue(new Error('opencode listChatModels unreachable: denied (HTTP 401)'));
     (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(provider);
     getDb().prepare(`
       INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled, source, endpoint_scope)
@@ -429,6 +429,221 @@ function tombstoneOf(platform: string, id: string): Record<string, unknown> | un
     | Record<string, unknown>
     | undefined;
 }
+
+function listChatModelsProvider(
+  platform: string,
+  ids: Array<Record<string, unknown>> | null,
+  err?: unknown,
+): { provider: Record<string, unknown>; listChatModels: ReturnType<typeof vi.fn> } {
+  const listChatModels = vi.fn(async (_key: string | null) => {
+    if (err) throw err;
+    return ids;
+  });
+  return { provider: { platform, listChatModels }, listChatModels };
+}
+
+function catalogProviderServing(platform: string, ids: string[]): OpenAICompatProvider {
+  const provider = new OpenAICompatProvider({ platform: platform as never, name: platform, baseUrl: 'https://example.invalid/v1' });
+  vi.spyOn(provider, 'listChatModels')
+    .mockResolvedValue(ids.map(id => ({ id, ownedBy: null })));
+  return provider;
+}
+
+describe('live-model-sync probe rules (Tier1+Tier2 rollout)', () => {
+  beforeEach(() => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    process.env.DEV_MODE = 'true';
+    process.env.NODE_ENV = 'test';
+    initDb(':memory:');
+    getDb().exec(
+      'DELETE FROM profile_models; DELETE FROM fallback_config; DELETE FROM api_keys; DELETE FROM models; DELETE FROM requests; DELETE FROM catalog_model_tombstones; DELETE FROM model_overrides;',
+    );
+    getDb().prepare("DELETE FROM settings WHERE key LIKE 'live_discovery_%'").run();
+    vi.clearAllMocks();
+    process.env.LIVE_MODEL_SYNC_INTERVAL_MS = '3600000';
+    delete process.env.LIVE_MODEL_SYNC_PLATFORMS;
+  });
+
+  afterEach(() => {
+    delete process.env.LIVE_MODEL_SYNC_INTERVAL_MS;
+    delete process.env.LIVE_MODEL_SYNC_PLATFORMS;
+    vi.unstubAllGlobals();
+  });
+
+  it('routeway and unorouter admit only *-suffixed :free ids', async () => {
+    for (const platform of ['routeway', 'unorouter']) {
+      process.env.LIVE_MODEL_SYNC_PLATFORMS = platform;
+      addApiKey(platform);
+      (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(
+        catalogProviderServing(platform, ['qwen/qwen3:free', 'gpt-4o', 'other:free']),
+      );
+      const result = await runLiveModelSync(getDb());
+      expect(result.ok).toBe(true);
+      expect(result.counts.paidSkipped).toBe(1);
+      expect(liveRows().map(r => r.model_id)).toEqual(['other:free', 'qwen/qwen3:free']);
+      getDb().exec('DELETE FROM profile_models; DELETE FROM fallback_config; DELETE FROM api_keys; DELETE FROM models;');
+      vi.clearAllMocks();
+    }
+  });
+
+  it('orcarouter admits *-free ids plus orcarouter/free', async () => {
+    process.env.LIVE_MODEL_SYNC_PLATFORMS = 'orcarouter';
+    addApiKey('orcarouter');
+    (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(
+      catalogProviderServing('orcarouter', ['model-x-free', 'orcarouter/free', 'paid-pro']),
+    );
+    const result = await runLiveModelSync(getDb());
+    expect(result.ok).toBe(true);
+    expect(result.counts.added).toBe(2);
+    expect(result.counts.paidSkipped).toBe(1);
+    expect(liveRows().map(r => r.model_id)).toEqual(['model-x-free', 'orcarouter/free']);
+  });
+
+  it('bazaarlink admits only the auto:free route', async () => {
+    process.env.LIVE_MODEL_SYNC_PLATFORMS = 'bazaarlink';
+    addApiKey('bazaarlink');
+    (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(
+      catalogProviderServing('bazaarlink', ['auto:free', 'deepseek-v3']),
+    );
+    const result = await runLiveModelSync(getDb());
+    expect(result.ok).toBe(true);
+    expect(result.counts.added).toBe(1);
+    expect(result.counts.paidSkipped).toBe(1);
+    expect(liveRows().map(r => r.model_id)).toEqual(['auto:free']);
+  });
+
+  it('reka admits only its two exact ids', async () => {
+    process.env.LIVE_MODEL_SYNC_PLATFORMS = 'reka';
+    addApiKey('reka');
+    (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(
+      catalogProviderServing('reka', ['reka-flash-3', 'reka-edge-2603', 'reka-core']),
+    );
+    const result = await runLiveModelSync(getDb());
+    expect(result.ok).toBe(true);
+    expect(result.counts.added).toBe(2);
+    expect(result.counts.paidSkipped).toBe(1);
+  });
+
+  it('nara admits only its three exact ids', async () => {
+    process.env.LIVE_MODEL_SYNC_PLATFORMS = 'nara';
+    addApiKey('nara');
+    (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(
+      catalogProviderServing('nara', ['mistral-large', 'mistral-medium-3-5', 'tencent-hy3', 'gpt-4o']),
+    );
+    const result = await runLiveModelSync(getDb());
+    expect(result.ok).toBe(true);
+    expect(result.counts.added).toBe(3);
+    expect(result.counts.paidSkipped).toBe(1);
+  });
+
+  it('agnes admits agnes-prefixed ids', async () => {
+    process.env.LIVE_MODEL_SYNC_PLATFORMS = 'agnes';
+    addApiKey('agnes');
+    (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(
+      catalogProviderServing('agnes', ['agnes-2.0-flash', 'gpt-4o']),
+    );
+    const result = await runLiveModelSync(getDb());
+    expect(result.ok).toBe(true);
+    expect(result.counts.added).toBe(1);
+    expect(result.counts.paidSkipped).toBe(1);
+    expect(liveRows().map(r => r.model_id)).toEqual(['agnes-2.0-flash']);
+  });
+
+  it('star-glob platforms admit every served id', async () => {
+    process.env.LIVE_MODEL_SYNC_PLATFORMS = 'sealion';
+    addApiKey('sealion');
+    (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(
+      catalogProviderServing('sealion', ['sealion-v4', 'anything-goes']),
+    );
+    const result = await runLiveModelSync(getDb());
+    expect(result.ok).toBe(true);
+    expect(result.counts.added).toBe(2);
+    expect(result.counts.paidSkipped).toBe(0);
+  });
+
+  it('unknown platforms in the env list are skipped silently', async () => {
+    process.env.LIVE_MODEL_SYNC_PLATFORMS = 'frobnicate';
+    const result = await runLiveModelSync(getDb());
+    expect(result.platforms).toEqual([]);
+    expect(result.failures).toEqual([]);
+    expect(getProvider as unknown as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
+    expect(liveRows()).toEqual([]);
+  });
+
+  it('excluded platforms are never attempted', async () => {
+    process.env.LIVE_MODEL_SYNC_PLATFORMS = 'huggingface,zhipu,modelscope,requesty,siliconflow,xkiro,qianfan,volcengine,longcat,xfyun';
+    addApiKey('huggingface');
+    const provider = catalogProviderServing('huggingface', ['some-model']);
+    const catalog = vi.spyOn(provider, 'listChatModels');
+    (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(provider);
+    const result = await runLiveModelSync(getDb());
+    expect(catalog).not.toHaveBeenCalled();
+    expect(result.platforms).toEqual([]);
+    expect(result.failures).toEqual([]);
+    expect(liveRows()).toEqual([]);
+  });
+
+  it('keyless pollinations probes with a null key and no key row', async () => {
+    process.env.LIVE_MODEL_SYNC_PLATFORMS = 'pollinations';
+    const { provider, listChatModels } = listChatModelsProvider('pollinations', [{ id: 'openai' }, { id: 'mistral-small' }]);
+    (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(provider);
+    const result = await runLiveModelSync(getDb());
+    expect(result.ok).toBe(true);
+    expect(listChatModels).toHaveBeenCalledTimes(1);
+    expect(listChatModels).toHaveBeenCalledWith(null);
+    expect(decrypt).not.toHaveBeenCalled();
+    expect(result.counts.added).toBe(2);
+    expect(liveRows().map(r => r.model_id)).toEqual(['mistral-small', 'openai']);
+  });
+
+  it('keyed listChatModels path passes the decrypted key and merges filtered results', async () => {
+    process.env.LIVE_MODEL_SYNC_PLATFORMS = 'nara';
+    addApiKey('nara');
+    const { provider, listChatModels } = listChatModelsProvider('nara', [{ id: 'mistral-large' }, { id: 'gpt-4o' }]);
+    (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(provider);
+    const result = await runLiveModelSync(getDb());
+    expect(result.ok).toBe(true);
+    expect(listChatModels).toHaveBeenCalledTimes(1);
+    expect(listChatModels).toHaveBeenCalledWith('plain-test-key');
+    expect(result.counts.added).toBe(1);
+    expect(result.counts.paidSkipped).toBe(1);
+    expect(liveRows().map(r => r.model_id)).toEqual(['mistral-large']);
+  });
+
+  it('a listChatModels throw is inconclusive: failure recorded, rows untouched', async () => {
+    process.env.LIVE_MODEL_SYNC_PLATFORMS = 'kilo';
+    const goneId = addLiveRow('kilo', 'model-x:free');
+    const { provider, listChatModels } = listChatModelsProvider('kilo', null, new Error('boom 405'));
+    (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(provider);
+    const result = await runLiveModelSync(getDb());
+    expect(listChatModels).toHaveBeenCalledWith(null);
+    expect(result.ok).toBe(false);
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0]!.platform).toBe('kilo');
+    expect(result.counts.deprecated).toBe(0);
+    const row = getDb().prepare('SELECT enabled FROM models WHERE id = ?').get(goneId) as { enabled: number };
+    expect(row.enabled).toBe(1);
+  });
+
+  it('an empty listChatModels roster is inconclusive and deprecates nothing', async () => {
+    process.env.LIVE_MODEL_SYNC_PLATFORMS = 'kilo';
+    addLiveRow('kilo', 'model-x:free');
+    const { provider } = listChatModelsProvider('kilo', []);
+    (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue(provider);
+    const result = await runLiveModelSync(getDb());
+    expect(result.failures).toHaveLength(1);
+    expect(result.counts.deprecated).toBe(0);
+  });
+
+  it('keyless kilo without a listChatModels adapter is skipped, not failed', async () => {
+    process.env.LIVE_MODEL_SYNC_PLATFORMS = 'kilo';
+    (getProvider as unknown as ReturnType<typeof vi.fn>).mockReturnValue({ platform: 'kilo' });
+    const result = await runLiveModelSync(getDb());
+    expect(result.platforms).toEqual([]);
+    expect(result.failures).toEqual([]);
+    expect(liveRows()).toEqual([]);
+  });
+});
 
 describe('live-model-sync deprecation and reinstate', () => {
   beforeEach(() => {
