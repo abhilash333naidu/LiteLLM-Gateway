@@ -611,7 +611,16 @@
     "bulkDelete": "Delete all",
     "bulkDeleteConfirm": "Delete {count}?",
     "bulkResult": "Updated {done}; failed {failed}.",
-    "bulkDeleteResult": "Deleted {done}; failed {failed}."
+    "bulkDeleteResult": "Deleted {done}; failed {failed}.",
+    "syncLiveModels": "Sync live models",
+    "syncLiveModelsHint": "Ask this provider for its current model list using a stored key (falls back to the next key) and update the Models table. No catalog involved.",
+    "syncAllLiveModels": "Sync all live models",
+    "syncAllLiveModelsHint": "Ask every provider with a stored key for its current model list, one provider at a time. Updates the Models table. No catalog involved.",
+    "syncingLive": "Syncing…",
+    "liveSyncSuccess": "Live sync: {added} added, {deprecated} deprecated ({platforms})",
+    "liveSyncSuccessAll": "Live sync: {added} added, {deprecated} deprecated across {platforms} providers",
+    "liveSyncFailed": "Live sync failed: {reason}",
+    "liveSyncNoKeys": "No usable key for this provider — add and validate a key first."
   },
   "backups": {
     "title": "Backups",

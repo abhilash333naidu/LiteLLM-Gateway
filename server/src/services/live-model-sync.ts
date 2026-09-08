@@ -337,16 +337,18 @@ interface KeyRow {
   [column: string]: unknown;
 }
 
-function findUsableKeyRow(db: Db, platform: string): KeyRow | undefined {
+function listUsableKeyRows(db: Db, platform: string): KeyRow[] {
   return db.prepare(
-    "SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy','unknown') ORDER BY id ASC LIMIT 1",
-  ).get(platform) as KeyRow | undefined;
+    "SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy','unknown') ORDER BY id ASC",
+  ).all(platform) as KeyRow[];
 }
 
 /** listChatModels collector. Keyless rules probe with a null key and NO key
- *  lookup; keyed rules decrypt the stored credential first. A throw or an
- *  empty/unparseable roster is inconclusive — the caller records a failure and
- *  never disables rows. */
+ *  lookup; keyed rules try each usable credential in id order and stop at the
+ *  first roster that parses — one key failing (401/transport/empty) falls
+ *  through to the next key, so a single bad key never blocks the platform.
+ *  A throw or an empty/unparseable roster from EVERY key is inconclusive —
+ *  the caller records a failure and never disables rows. */
 async function fetchViaListChatModels(
   db: Db,
   platform: string,
@@ -355,24 +357,45 @@ async function fetchViaListChatModels(
   listChatModels: ListChatModelsFn,
 ): Promise<CollectorOutput> {
   const notAttempted: CollectorOutput = { models: [], paidSkipped: 0, notAttempted: true };
-  let apiKey: string | null = null;
-  let proxyRow: { proxy_encrypted: string | null; proxy_iv: string | null; proxy_auth_tag: string | null } | undefined;
-  if (!rule.keyless) {
-    const keyRow = findUsableKeyRow(db, platform);
-    if (!keyRow) return notAttempted;
+  if (rule.keyless) {
+    return fetchWithKey(db, platform, rule, provider, listChatModels, null, undefined);
+  }
+  const keyRows = listUsableKeyRows(db, platform);
+  if (keyRows.length === 0) return notAttempted;
+  let lastError: unknown = null;
+  for (const keyRow of keyRows) {
+    let apiKey: string;
     try {
       apiKey = decrypt(keyRow.encrypted_key, keyRow.iv, keyRow.auth_tag);
     } catch {
-      throw new Error(platform + ' stored key could not be decrypted');
+      lastError = new Error(platform + ' stored key could not be decrypted');
+      continue;
     }
     // Mirror health.ts: probe through the key's own proxy exit.
-    proxyRow = {
+    const proxyRow = {
       proxy_encrypted: (keyRow.proxy_encrypted as string | null) ?? null,
       proxy_iv: (keyRow.proxy_iv as string | null) ?? null,
       proxy_auth_tag: (keyRow.proxy_auth_tag as string | null) ?? null,
     };
+    try {
+      return await fetchWithKey(db, platform, rule, provider, listChatModels, apiKey, proxyRow);
+    } catch (err: unknown) {
+      lastError = err;
+      continue;
+    }
   }
+  throw lastError instanceof Error ? lastError : new Error(platform + ' listChatModels unreachable');
+}
 
+async function fetchWithKey(
+  _db: Db,
+  platform: string,
+  _rule: LiveProbeRule,
+  provider: object,
+  listChatModels: ListChatModelsFn,
+  apiKey: string | null,
+  proxyRow: { proxy_encrypted: string | null; proxy_iv: string | null; proxy_auth_tag: string | null } | undefined,
+): Promise<CollectorOutput> {
   let discovered: unknown;
   try {
     discovered = await withKeyProxy(
@@ -589,18 +612,52 @@ function persistSettings(runMs: number, result: LiveDiscoveryResult, error: stri
   }
 }
 
+/** Platforms eligible for live discovery: the scheduled default set. Exported
+ *  so the manual per-provider route can validate a single name against the
+ *  same list (plus openrouter, which has its own keyless collector). */
+export function liveSyncPlatforms(): string[] {
+  return liveDiscoveryPlatforms();
+}
+
+/** Single-platform live sync, independent of the signed catalog: hits the
+ *  provider's real `/models` roster with the stored key(s) and reconciles only
+ *  that platform's `source='live'` rows. Used by the Keys-page "Sync live
+ *  models" button. Throws 400 on unknown/custom platforms. */
+export async function runLiveModelSyncForPlatform(db: Db, platformRaw: string): Promise<LiveDiscoveryResult> {
+  const platform = platformRaw.trim().toLowerCase();
+  if (!platform) {
+    throw Object.assign(new Error('platform is required'), { status: 400, code: 'bad_request' });
+  }
+  if (platform === 'custom') {
+    throw Object.assign(
+      new Error('custom endpoints sync per-endpoint via Fetch models on the Keys page, not via live discovery'),
+      { status: 400, code: 'custom_use_discover' },
+    );
+  }
+  const known = new Set(liveDiscoveryPlatforms());
+  if (!known.has(platform)) {
+    throw Object.assign(new Error(`unknown live-sync platform '${platformRaw}'`), { status: 400, code: 'unknown_platform' });
+  }
+  return syncPlatforms(db, [platform]);
+}
+
 /** Reconcile the `models` table with providers' current rosters. One
  *  platform's failure is recorded and never disables existing rows: an empty
  *  or failed fetch is inconclusive, never evidence of removal. */
 export async function runLiveModelSync(db: Db): Promise<LiveDiscoveryResult> {
+  return syncPlatforms(db, liveDiscoveryPlatforms());
+}
+
+/** Shared core: reconcile exactly the given platforms. No catalog fetch, no
+ *  license check — pure provider-roster truth. */
+async function syncPlatforms(db: Db, platforms: string[]): Promise<LiveDiscoveryResult> {
   const startedAt = Date.now();
   const counts: LiveDiscoveryCounts = { added: 0, reinstated: 0, deprecated: 0, skipped: 0, paidSkipped: 0, tombstoned: 0 };
   const failures: Array<{ platform: string; error: string }> = [];
   const seen: Record<string, string[]> = {};
-  void db;
 
   try {
-    for (const platform of liveDiscoveryPlatforms()) {
+    for (const platform of platforms) {
       try {
         const out = platform === 'openrouter'
           ? await fetchOpenRouterModels()

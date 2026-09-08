@@ -20,6 +20,8 @@ import { endpointScopeForBaseUrl, normalizeBaseUrl } from '../lib/endpoint-scope
 import { recordCustomModelTombstone } from '../services/custom-model-tombstone.js';
 import type { Db } from '../db/types.js';
 import { parseModelScope } from '../lib/model-scope.js';
+import { createAdminRateLimiter } from '../middleware/rateLimit.js';
+import { runLiveModelSync, runLiveModelSyncForPlatform } from '../services/live-model-sync.js';
 import { KEY_PROXY_URL_ERROR, KEY_PROXY_URL_MAX, decryptProxyUrl, encryptProxyUrl, isValidKeyProxyUrl, maskProxyUrl } from '../lib/key-proxy.js';
 
 export const keysRouter = Router();
@@ -1399,6 +1401,67 @@ keysRouter.patch('/platform/:platform', (req: Request, res: Response) => {
   const result = db.prepare('UPDATE api_keys SET enabled = ? WHERE platform = ?').run(enabled ? 1 : 0, platform);
 
   res.json({ success: true, enabled, updatedKeys: result.changes });
+});
+
+// ── Live provider-model sync (manual, catalog-independent) ─────────────────
+// Hits each provider's real `/models` roster with the stored key(s) — first
+// usable key wins, next key on failure — and reconciles `source='live'` rows.
+// No signed-catalog fetch, no license check: pure provider truth, so the
+// Models table (`GET /api/fallback`) reflects what the key can actually use.
+// Throttled: one upstream roster per platform, and "all" fans out to ~28.
+const LIVE_SYNC_RATE_LIMIT_RPM = Number(process.env.LIVE_SYNC_RATE_LIMIT_RPM ?? 10);
+const liveSyncLimiter = createAdminRateLimiter(LIVE_SYNC_RATE_LIMIT_RPM);
+
+// Overlap guard: a second manual run joins the in-flight one instead of
+// doubling upstream traffic (mirrors health.ts checkAllInFlight).
+let liveSyncInFlight: Promise<unknown> | null = null;
+
+// POST /api/keys/live-sync — all platforms with stored keys.
+keysRouter.post('/live-sync', liveSyncLimiter, async (_req: Request, res: Response) => {
+  if (liveSyncInFlight) {
+    try {
+      const result = await liveSyncInFlight;
+      res.json(result);
+    } catch (e: any) {
+      res.status(502).json({ error: { message: e?.message ?? 'live sync failed', code: 'upstream_error' } });
+    }
+    return;
+  }
+  const run = runLiveModelSync(getDb());
+  liveSyncInFlight = run;
+  try {
+    res.json(await run);
+  } catch (e: any) {
+    res.status(502).json({ error: { message: e?.message ?? 'live sync failed', code: 'upstream_error' } });
+  } finally {
+    liveSyncInFlight = null;
+  }
+});
+
+// POST /api/keys/live-sync/:platform — one provider only.
+keysRouter.post('/live-sync/:platform', liveSyncLimiter, async (req: Request, res: Response) => {
+  const platform = String(req.params.platform ?? '');
+  if (liveSyncInFlight) {
+    // A full "all" run already covers this platform; joining it avoids a
+    // second roster fetch against the same provider in the same minute.
+    try {
+      const result = await liveSyncInFlight;
+      res.json(result);
+    } catch (e: any) {
+      res.status(502).json({ error: { message: e?.message ?? 'live sync failed', code: 'upstream_error' } });
+    }
+    return;
+  }
+  const run = runLiveModelSyncForPlatform(getDb(), platform);
+  liveSyncInFlight = run;
+  try {
+    res.json(await run);
+  } catch (e: any) {
+    const status = Number.isFinite(e?.status) ? e.status : 502;
+    res.status(status).json({ error: { message: e?.message ?? 'live sync failed', code: e?.code ?? 'upstream_error' } });
+  } finally {
+    liveSyncInFlight = null;
+  }
 });
 
 // Update key (toggle enable/disable or edit label)
