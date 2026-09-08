@@ -415,6 +415,11 @@ export interface ModelGroupRow {
   key: string
   label: string
   members: Row[]
+  // Live probe plumbing (#1150): injected by FallbackPage so the shared row
+  // component doesn't need a separate prop surface.
+  testStatesById?: ReadonlyMap<number, import('@/lib/model-test').ModelTestState>
+  onTestMember?: (member: Row) => void
+  onTestGroup?: () => void
 }
 
 // Group merged rows by their server-assigned groupKey (or a per-row "solo" key

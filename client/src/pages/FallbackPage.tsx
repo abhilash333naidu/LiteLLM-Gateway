@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   DndContext,
@@ -19,6 +19,7 @@ import { Boxes, ChevronDown, Search, X } from 'lucide-react'
 import { Link, useNavigate } from 'react-router-dom'
 import { useI18n } from '@/i18n'
 import { apiFetch } from '@/lib/api'
+import { MODEL_TEST_GAP_MS, type ModelTestState } from '@/lib/model-test'
 import {
   buildGroups,
   groupMaxContext,
@@ -263,6 +264,121 @@ export default function FallbackPage() {
     const ids = new Set(memberIds)
     setLocalEntries(allEntries.map(e => (ids.has(e.modelDbId) ? { ...e, enabled } : e)))
   }
+
+  // ── Live probe: per-provider states + Test-All over visible+enabled (#1150) ──
+  // Real inference via POST /api/fallback/test ("Reply with just: ok"), one
+  // request at a time with a 900ms gap so free-tier RPMs aren't burst.
+  const [testStates, setTestStates] = useState<Map<number, ModelTestState>>(new Map())
+  const bulkAbortRef = useRef<AbortController | null>(null)
+  const isTestingAny = useMemo(() => [...testStates.values()].some(s => s.status === 'testing'), [testStates])
+  const setTestState = useCallback((id: number, st: ModelTestState) => {
+    setTestStates(prev => {
+      const next = new Map(prev)
+      next.set(id, st)
+      return next
+    })
+  }, [])
+
+  async function probeOne(modelDbId: number, signal?: AbortSignal): Promise<void> {
+    setTestState(modelDbId, { status: 'testing' })
+    try {
+      const res = await apiFetch<any>('/api/fallback/test', {
+        method: 'POST',
+        body: JSON.stringify({ modelDbId }),
+        signal,
+      } as any)
+      // Server returns ModelTestResult on success.
+      if (res && typeof res.ok === 'boolean') {
+        if (res.ok) setTestState(modelDbId, { status: 'ok', latencyMs: res.latencyMs, replyPreview: res.replyPreview })
+        else setTestState(modelDbId, { status: 'error', error: res.error ?? 'empty_response', latencyMs: res.latencyMs, replyPreview: res.replyPreview })
+      } else {
+        setTestState(modelDbId, { status: 'ok', latencyMs: res?.latencyMs })
+      }
+    } catch (e: any) {
+      if (e?.name === 'AbortError' || signal?.aborted) {
+        setTestStates(prev => {
+          const n = new Map(prev)
+          if (n.get(modelDbId)?.status === 'testing') n.delete(modelDbId)
+          return n
+        })
+        return
+      }
+      const msg: string = e?.message ?? 'failed'
+      setTestState(modelDbId, { status: 'error', error: msg })
+    }
+  }
+
+  const handleTestMember = useCallback(async (member: Row) => {
+    if (isTestingAny) return
+    await probeOne(member.modelDbId, bulkAbortRef.current?.signal)
+  }, [isTestingAny, setTestState])
+
+  const handleTestGroup = useCallback(async (group: ModelGroupRow) => {
+    if (isTestingAny) return
+    const ac = new AbortController()
+    bulkAbortRef.current = ac
+    const enabledMembers = group.members.filter(m => m.enabled)
+    for (let i = 0; i < enabledMembers.length; i++) {
+      if (ac.signal.aborted) break
+      await probeOne(enabledMembers[i].modelDbId, ac.signal)
+      if (i < enabledMembers.length - 1 && !ac.signal.aborted) {
+        await new Promise<void>(resolve => {
+          const t = setTimeout(resolve, MODEL_TEST_GAP_MS)
+          ac.signal.addEventListener('abort', () => { clearTimeout(t); resolve() }, { once: true })
+        })
+      }
+    }
+    bulkAbortRef.current = null
+  }, [isTestingAny, setTestState])
+
+  const handleTestAll = useCallback(async () => {
+    // Stop-in-progress run if one is active.
+    if (bulkAbortRef.current) {
+      bulkAbortRef.current.abort()
+      bulkAbortRef.current = null
+      // Clear any still-testing spinner.
+      setTestStates(prev => {
+        const n = new Map(prev)
+        for (const [k, v] of n) if (v.status === 'testing') n.delete(k)
+        return n
+      })
+      return
+    }
+    const ids = visibleGroups.flatMap(g => g.members.filter(m => m.enabled).map(m => m.modelDbId))
+    const uniq = [...new Set(ids)]
+    if (uniq.length === 0) return
+    const ac = new AbortController()
+    bulkAbortRef.current = ac
+    for (let i = 0; i < uniq.length; i++) {
+      if (ac.signal.aborted) break
+      await probeOne(uniq[i], ac.signal)
+      if (i < uniq.length - 1 && !ac.signal.aborted) {
+        await new Promise<void>(resolve => {
+          const t = setTimeout(resolve, MODEL_TEST_GAP_MS)
+          ac.signal.addEventListener('abort', () => { clearTimeout(t); resolve() }, { once: true })
+        })
+      }
+    }
+    bulkAbortRef.current = null
+  }, [visibleGroups, setTestState])
+
+  // Decorate rendered groups with probe state/handlers so the shared row cell
+  // doesn't need its own prop plumbing change in two places.
+  const decoratedGroups = useMemo(() => {
+    const map = testStates as ReadonlyMap<number, ModelTestState>
+    return renderedGroups.map(g => ({
+      ...g,
+      testStatesById: map,
+      onTestMember: (member: Row) => { void handleTestMember(member) },
+      onTestGroup: () => { void handleTestGroup(g) },
+    }))
+  }, [renderedGroups, testStates, handleTestMember, handleTestGroup])
+  // Header Test-All label reflects the run state (#1150).
+  const testingVisibleTotal = visibleGroups.flatMap(g => g.members.filter(m => m.enabled)).length
+  const testedVisibleCount = visibleGroups.flatMap(g => g.members.filter(m => {
+    const s = testStates.get(m.modelDbId)
+    return s?.status === 'ok' || s?.status === 'error'
+  })).length
 
   // Bulk on/off over what is currently on screen (#895). Curating a chain by
   // hand means turning most of the catalog off, which one row at a time over
@@ -557,11 +673,15 @@ export default function FallbackPage() {
               <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleGroupedDragEnd}>
                 <div className="rounded-2xl border overflow-x-auto">
                   <table className="w-full text-sm">
-                    <ModelTableHead />
-                    <SortableContext items={renderedGroups.map(g => `grp:${g.key}`)} strategy={verticalListSortingStrategy}>
+                    <ModelTableHead
+                      onTestAll={handleTestAll}
+                      testAllDisabled={testingVisibleTotal === 0 && !isTestingAny}
+                      testAllLabel={isTestingAny ? `${t('models.testStop')} · ${testedVisibleCount}/${testingVisibleTotal}` : t('models.testAll')}
+                    />
+                    <SortableContext items={decoratedGroups.map(g => `grp:${g.key}`)} strategy={verticalListSortingStrategy}>
                       <tbody>
-                        {renderedGroups.map(g => (
-                          <SortableGroupRow key={g.key} group={g} rank={rankByKey.get(g.key) ?? 0} onToggleGroup={handleGroupToggle} allRows={rows} rateUsage={rateUsageByModel} />
+                        {decoratedGroups.map(g => (
+                          <SortableGroupRow key={g.key} group={g as any} rank={rankByKey.get(g.key) ?? 0} onToggleGroup={handleGroupToggle} allRows={rows} rateUsage={rateUsageByModel} />
                         ))}
                       </tbody>
                     </SortableContext>
@@ -571,15 +691,19 @@ export default function FallbackPage() {
             ) : (
               <div className="rounded-2xl border overflow-x-auto">
                 <table className="w-full text-sm">
-                  <ModelTableHead />
+                  <ModelTableHead
+                    onTestAll={handleTestAll}
+                    testAllDisabled={testingVisibleTotal === 0 && !isTestingAny}
+                    testAllLabel={isTestingAny ? `${t('models.testStop')} · ${testedVisibleCount}/${testingVisibleTotal}` : t('models.testAll')}
+                  />
                   <tbody>
-                    {renderedGroups.map(g => (
+                    {decoratedGroups.map(g => (
                       <tr
                         key={g.key}
                         onClick={() => navigate(`/models/chat/${encodeURIComponent(g.members[0].canonicalId ?? g.members[0].modelId)}`)}
                         className={`group/row border-b last:border-0 cursor-pointer transition-colors hover:[&>td]:bg-muted/50 [&>td:first-child]:rounded-l-lg [&>td:last-child]:rounded-r-lg ${g.members.some(m => m.enabled) ? '' : 'opacity-50'}`}
                       >
-                        <GroupHeaderCells group={g} rank={rankByKey.get(g.key) ?? 0} onToggleGroup={handleGroupToggle} allRows={rows} rateUsage={rateUsageByModel} />
+                        <GroupHeaderCells group={g as any} rank={rankByKey.get(g.key) ?? 0} onToggleGroup={handleGroupToggle} allRows={rows} rateUsage={rateUsageByModel} />
                       </tr>
                     ))}
                   </tbody>
