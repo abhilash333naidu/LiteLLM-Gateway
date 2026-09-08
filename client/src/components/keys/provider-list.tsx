@@ -156,6 +156,54 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
     },
   })
 
+  // Live provider-model sync (manual, catalog-independent). One upstream
+  // roster per provider; "all" walks providers sequentially server-side.
+  const invalidateAfterLiveSync = () => {
+    for (const key of ['fallback', 'models', 'premium']) {
+      queryClient.invalidateQueries({ queryKey: [key] })
+    }
+    queryClient.invalidateQueries({ queryKey: ['fallback', 'routing'] })
+  }
+  const liveSyncSummary = (data: { counts?: { added?: number; deprecated?: number }; platforms?: string[] }, all: boolean) => {
+    const added = data?.counts?.added ?? 0
+    const deprecated = data?.counts?.deprecated ?? 0
+    const platforms = (data?.platforms ?? []).join(', ')
+    return all
+      ? t('keys.liveSyncSuccessAll', { added, deprecated, platforms: data?.platforms?.length ?? 0 })
+      : t('keys.liveSyncSuccess', { added, deprecated, platforms: platforms || '—' })
+  }
+  const syncProviderLive = useMutation({
+    meta: { silenceToast: true },
+    mutationFn: (platform: string) =>
+      apiFetch<{ counts?: { added?: number; deprecated?: number }; platforms?: string[] }>(
+        `/api/keys/live-sync/${encodeURIComponent(platform)}`,
+        { method: 'POST' },
+      ),
+    onSuccess: (data) => {
+      invalidateAfterLiveSync()
+      toast.success(liveSyncSummary(data, false))
+    },
+    onError: (error) => {
+      toast.error(t('keys.liveSyncFailed', { reason: error instanceof Error ? error.message : String(error) }))
+    },
+  })
+  const syncAllLive = useMutation({
+    meta: { silenceToast: true },
+    mutationFn: () =>
+      apiFetch<{ counts?: { added?: number; deprecated?: number }; platforms?: string[] }>(
+        '/api/keys/live-sync',
+        { method: 'POST' },
+      ),
+    onSuccess: (data) => {
+      invalidateAfterLiveSync()
+      toast.success(liveSyncSummary(data, true))
+    },
+    onError: (error) => {
+      toast.error(t('keys.liveSyncFailed', { reason: error instanceof Error ? error.message : String(error) }))
+    },
+  })
+  const liveSyncBusy = syncAllLive.isPending || syncProviderLive.isPending
+
   const togglePlatform = useMutation({
     mutationFn: ({ platform, enabled }: { platform: string; enabled: boolean }) =>
       apiFetch(`/api/keys/platform/${platform}`, {
@@ -368,6 +416,18 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
           ]}
           ariaLabel={t('keys.filterAll')}
         />
+        <Tooltip text={t('keys.syncAllLiveModelsHint')}>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => syncAllLive.mutate()}
+            disabled={liveSyncBusy}
+            aria-label={t('keys.syncAllLiveModels')}
+          >
+            <RefreshCw className={`size-3.5 ${syncAllLive.isPending ? 'animate-spin' : ''}`} />
+            {syncAllLive.isPending ? t('keys.syncingLive') : t('keys.syncAllLiveModels')}
+          </Button>
+        </Tooltip>
         <span className="flex-1" />
         <span className="text-xs text-muted-foreground tabular-nums">
           {t('keys.providerCountSummary', { providers: totalProviders, keys: totalKeys })}
@@ -418,6 +478,21 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
                       )}
                     </span>
                   </button>
+                  {group.value !== 'custom' && (
+                    <Tooltip text={t('keys.syncLiveModelsHint')}>
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        onClick={() => syncProviderLive.mutate(group.value)}
+                        disabled={liveSyncBusy}
+                        aria-label={t('keys.syncLiveModels')}
+                      >
+                        <RefreshCw
+                          className={`size-3 ${syncProviderLive.isPending && (syncProviderLive.variables as string) === group.value ? 'animate-spin' : ''}`}
+                        />
+                      </Button>
+                    </Tooltip>
+                  )}
                   {(group.url || proxyEnabled) && (
                     <DropdownMenu>
                       <DropdownMenuTrigger

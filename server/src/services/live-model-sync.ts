@@ -12,7 +12,7 @@ import {
   isCatalogModelTombstoned,
   recordCatalogModelTombstone,
 } from './model-state.js';
-import { getProvider } from '../providers/index.js';
+import { getProvider, hasProvider } from '../providers/index.js';
 import { BaseProvider } from '../providers/base.js';
 import { decrypt } from '../lib/crypto.js';
 import { decryptProxyUrl } from '../lib/key-proxy.js';
@@ -337,42 +337,67 @@ interface KeyRow {
   [column: string]: unknown;
 }
 
-function findUsableKeyRow(db: Db, platform: string): KeyRow | undefined {
+function listUsableKeyRows(db: Db, platform: string): KeyRow[] {
   return db.prepare(
-    "SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy','unknown') ORDER BY id ASC LIMIT 1",
-  ).get(platform) as KeyRow | undefined;
+    "SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy','unknown') ORDER BY id ASC",
+  ).all(platform) as KeyRow[];
 }
 
 /** listChatModels collector. Keyless rules probe with a null key and NO key
- *  lookup; keyed rules decrypt the stored credential first. A throw or an
- *  empty/unparseable roster is inconclusive — the caller records a failure and
- *  never disables rows. */
+ *  lookup; keyed rules try each usable credential in id order and stop at the
+ *  first roster that parses — one key failing (401/transport/empty) falls
+ *  through to the next key, so a single bad key never blocks the platform.
+ *  A throw or an empty/unparseable roster from EVERY key is inconclusive —
+ *  the caller records a failure and never disables rows. */
 async function fetchViaListChatModels(
   db: Db,
   platform: string,
   rule: LiveProbeRule,
   provider: object,
   listChatModels: ListChatModelsFn,
+  admitAll = false,
 ): Promise<CollectorOutput> {
   const notAttempted: CollectorOutput = { models: [], paidSkipped: 0, notAttempted: true };
-  let apiKey: string | null = null;
-  let proxyRow: { proxy_encrypted: string | null; proxy_iv: string | null; proxy_auth_tag: string | null } | undefined;
-  if (!rule.keyless) {
-    const keyRow = findUsableKeyRow(db, platform);
-    if (!keyRow) return notAttempted;
+  if (rule.keyless) {
+    return fetchWithKey(db, platform, rule, provider, listChatModels, null, undefined, admitAll);
+  }
+  const keyRows = listUsableKeyRows(db, platform);
+  if (keyRows.length === 0) return notAttempted;
+  let lastError: unknown = null;
+  for (const keyRow of keyRows) {
+    let apiKey: string;
     try {
       apiKey = decrypt(keyRow.encrypted_key, keyRow.iv, keyRow.auth_tag);
     } catch {
-      throw new Error(platform + ' stored key could not be decrypted');
+      lastError = new Error(platform + ' stored key could not be decrypted');
+      continue;
     }
     // Mirror health.ts: probe through the key's own proxy exit.
-    proxyRow = {
+    const proxyRow = {
       proxy_encrypted: (keyRow.proxy_encrypted as string | null) ?? null,
       proxy_iv: (keyRow.proxy_iv as string | null) ?? null,
       proxy_auth_tag: (keyRow.proxy_auth_tag as string | null) ?? null,
     };
+    try {
+      return await fetchWithKey(db, platform, rule, provider, listChatModels, apiKey, proxyRow, admitAll);
+    } catch (err: unknown) {
+      lastError = err;
+      continue;
+    }
   }
+  throw lastError instanceof Error ? lastError : new Error(platform + ' listChatModels unreachable');
+}
 
+async function fetchWithKey(
+  _db: Db,
+  platform: string,
+  _rule: LiveProbeRule,
+  provider: object,
+  listChatModels: ListChatModelsFn,
+  apiKey: string | null,
+  proxyRow: { proxy_encrypted: string | null; proxy_iv: string | null; proxy_auth_tag: string | null } | undefined,
+  admitAll = false,
+): Promise<CollectorOutput> {
   let discovered: unknown;
   try {
     discovered = await withKeyProxy(
@@ -402,16 +427,18 @@ async function fetchViaListChatModels(
   }
   if (entries.length === 0) throw new Error(platform + ' returned an empty model list');
 
-  return filterFreeModels(platform, entries);
+  return filterFreeModels(platform, entries, admitAll);
 }
 
 /** Apply the platform's LIVE_PROBE_RULES patterns; non-matching ids are
- *  presumably paid and counted, never stored. */
-function filterFreeModels(platform: string, entries: ListedChatModel[]): CollectorOutput {
+ *  presumably paid and counted, never stored. Manual per-provider sync sets
+ *  `admitAll` — the operator explicitly asked "what does this key serve", so
+ *  every listed id is reconciled instead of only the free subset. */
+function filterFreeModels(platform: string, entries: ListedChatModel[], admitAll = false): CollectorOutput {
   const models: CollectedLiveModel[] = [];
   let paidSkipped = 0;
   for (const entry of entries) {
-    if (!liveFreePass(platform, entry.id)) {
+    if (!admitAll && !liveFreePass(platform, entry.id)) {
       paidSkipped += 1;
       continue;
     }
@@ -420,16 +447,18 @@ function filterFreeModels(platform: string, entries: ListedChatModel[]): Collect
   return { models, paidSkipped };
 }
 
-/** Keyed free-tier gateway roster. Platforms with no LIVE_PROBE_RULES entry
- *  (unknown env names, deliberately excluded wallets) skip silently — not a
- *  failure. Probing goes through the provider's listChatModels override only:
- *  the typeof guard plus the BaseProvider-default check skip providers whose
- *  adapter has not landed yet. One platform's failure is isolated and never
- *  disables rows. */
-async function fetchKeyedPlatformModels(db: Db, platform: string): Promise<CollectorOutput> {
+/** Keyed provider roster. Scheduled sync requires a LIVE_PROBE_RULES entry
+ *  (deliberately excluded wallets skip silently — not a failure); manual
+ *  per-provider sync sets `admitAll` and probes ANY registered provider, since
+ *  the operator explicitly asked what that key serves. Probing goes through
+ *  the provider's listChatModels override only: the typeof guard plus the
+ *  BaseProvider-default check skip providers whose adapter has not landed yet.
+ *  One platform's failure is isolated and never disables rows. */
+async function fetchKeyedPlatformModels(db: Db, platform: string, admitAll = false): Promise<CollectorOutput> {
   const notAttempted: CollectorOutput = { models: [], paidSkipped: 0, notAttempted: true };
   const rule = LIVE_PROBE_RULES[platform];
-  if (!rule) return notAttempted;
+  if (!rule && !admitAll) return notAttempted;
+  const effectiveRule = rule ?? { patterns: ['*'] };
   let provider: unknown;
   try {
     provider = getProvider(platform as Platform);
@@ -444,7 +473,7 @@ async function fetchKeyedPlatformModels(db: Db, platform: string): Promise<Colle
   const hasListing = typeof listChatModels === 'function'
     && listChatModels !== BaseProvider.prototype.listChatModels;
   if (!hasListing) return notAttempted;
-  return fetchViaListChatModels(db, platform, rule, provider as object, listChatModels as ListChatModelsFn);
+  return fetchViaListChatModels(db, platform, effectiveRule, provider as object, listChatModels as ListChatModelsFn, admitAll);
 }
 
 /** Whether a roster id counts as free on this platform. Unknown platforms
@@ -589,22 +618,85 @@ function persistSettings(runMs: number, result: LiveDiscoveryResult, error: stri
   }
 }
 
+/** Platforms eligible for live discovery: the scheduled default set. Exported
+ *  so the manual per-provider route can validate a single name against the
+ *  same list (plus openrouter, which has its own keyless collector). */
+export function liveSyncPlatforms(): string[] {
+  return liveDiscoveryPlatforms();
+}
+
+/** Single-platform live sync, independent of the signed catalog: hits the
+ *  provider's real `/models` roster with the stored key(s) and reconciles only
+ *  that platform's `source='live'` rows. Used by the Keys-page "Sync live
+ *  models" button. Admits the full roster (not just the free subset) — the
+ *  operator explicitly asked what that key serves. Throws 400 on
+ *  unknown/custom platforms, 502 when no usable key or no listing exists. */
+export async function runLiveModelSyncForPlatform(db: Db, platformRaw: string): Promise<LiveDiscoveryResult> {
+  const platform = platformRaw.trim().toLowerCase();
+  if (!platform) {
+    throw Object.assign(new Error('platform is required'), { status: 400, code: 'bad_request' });
+  }
+  if (platform === 'custom') {
+    throw Object.assign(
+      new Error('custom endpoints sync per-endpoint via Fetch models on the Keys page, not via live discovery'),
+      { status: 400, code: 'custom_use_discover' },
+    );
+  }
+  if (!hasProvider(platform as Platform)) {
+    throw Object.assign(new Error(`unknown live-sync platform '${platformRaw}'`), { status: 400, code: 'unknown_platform' });
+  }
+  if (platform !== 'openrouter') {
+    const provider = getProvider(platform as Platform);
+    const listChatModels = (provider as { listChatModels?: unknown }).listChatModels;
+    const hasListing = typeof listChatModels === 'function'
+      && listChatModels !== BaseProvider.prototype.listChatModels;
+    if (!hasListing) {
+      throw Object.assign(
+        new Error(`'${platformRaw}' does not expose a live model list`),
+        { status: 400, code: 'no_listing' },
+      );
+    }
+    const keys = listUsableKeyRows(db, platform);
+    if (keys.length === 0) {
+      throw Object.assign(
+        new Error(`No usable key for '${platformRaw}' — add and validate a key first`),
+        { status: 502, code: 'no_usable_key' },
+      );
+    }
+  }
+  const result = await syncPlatforms(db, [platform], { admitAll: true });
+  if (!result.ok && result.platforms.length === 0) {
+    const first = result.failures[0];
+    throw Object.assign(
+      new Error(first ? `${platformRaw}: ${first.error}` : `live sync produced no models for '${platformRaw}'`),
+      { status: 502, code: 'upstream_error' },
+    );
+  }
+  return result;
+}
+
 /** Reconcile the `models` table with providers' current rosters. One
  *  platform's failure is recorded and never disables existing rows: an empty
  *  or failed fetch is inconclusive, never evidence of removal. */
 export async function runLiveModelSync(db: Db): Promise<LiveDiscoveryResult> {
+  return syncPlatforms(db, liveDiscoveryPlatforms());
+}
+
+/** Shared core: reconcile exactly the given platforms. No catalog fetch, no
+ *  license check — pure provider-roster truth. `admitAll` (manual single
+ *  sync) reconciles the full roster instead of only the free subset. */
+async function syncPlatforms(db: Db, platforms: string[], opts: { admitAll?: boolean } = {}): Promise<LiveDiscoveryResult> {
   const startedAt = Date.now();
   const counts: LiveDiscoveryCounts = { added: 0, reinstated: 0, deprecated: 0, skipped: 0, paidSkipped: 0, tombstoned: 0 };
   const failures: Array<{ platform: string; error: string }> = [];
   const seen: Record<string, string[]> = {};
-  void db;
 
   try {
-    for (const platform of liveDiscoveryPlatforms()) {
+    for (const platform of platforms) {
       try {
         const out = platform === 'openrouter'
           ? await fetchOpenRouterModels()
-          : await fetchKeyedPlatformModels(db, platform);
+          : await fetchKeyedPlatformModels(db, platform, opts.admitAll === true);
         counts.paidSkipped += out.paidSkipped;
         if (out.notAttempted) continue;
         // An empty list is inconclusive, never evidence of removal.
