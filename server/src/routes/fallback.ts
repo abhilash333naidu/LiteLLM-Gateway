@@ -16,6 +16,8 @@ import { getActiveProfileId } from '../services/profile-models.js';
 import { qualifiedModelMemberId } from '../lib/endpoint-scope.js';
 import { overriddenFieldNames } from '../services/model-state.js';
 import { parseModelScope, scopeAllows } from '../lib/model-scope.js';
+import { createAdminRateLimiter } from '../middleware/rateLimit.js';
+import { testSingleModel } from '../services/model-test.js';
 
 export const fallbackRouter = Router();
 
@@ -665,4 +667,34 @@ fallbackRouter.get('/rate-limit-usage', (_req: Request, res: Response) => {
   });
 
   res.json({ generatedAtMs: now, rows });
+});
+
+// ── Live model test: POST /api/fallback/test { modelDbId } ──────────────────
+// Real inference probe — sends "Reply with just: ok" via the gateway router
+// and succeeds only on non-empty reply text. Used for the per-model test icon
+// and the bulk "Test All" over visible+enabled rows. Rate-limited to avoid
+// bursting free-tier RPMs from the dashboard.
+const MODEL_TEST_RATE_LIMIT_RPM = Number(process.env.MODEL_TEST_RATE_LIMIT_RPM ?? 30);
+const modelTestLimiter = createAdminRateLimiter(MODEL_TEST_RATE_LIMIT_RPM);
+
+fallbackRouter.post('/test', modelTestLimiter, async (req: Request, res: Response) => {
+  const schema = z.object({ modelDbId: z.number().int().positive() });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', '), code: 'bad_request' } });
+    return;
+  }
+  try {
+    const result = await testSingleModel(parsed.data.modelDbId, { signal: (req as any).signal } as any);
+    res.json(result);
+  } catch (e: any) {
+    const status = Number.isFinite(e?.status) ? e.status : 502;
+    const latencyMs = e?.latencyMs;
+    res.status(status).json({
+      error: { message: e?.message ?? 'upstream_error', code: e?.code ?? 'upstream_error' },
+      ...(latencyMs != null ? { latencyMs } : {}),
+      ...(e?.platform ? { platform: e.platform } : {}),
+      ...(e?.modelId ? { modelId: e.modelId } : {}),
+    });
+  }
 });

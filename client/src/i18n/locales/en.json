@@ -284,7 +284,22 @@
     "disableAll": "Disable all",
     "enableAllHint": "Turn on every model shown, then Save",
     "disableAllHint": "Turn off every model shown, then Save",
-    "enabledOfShown": "{enabled} of {shown} shown models are in the chain"
+    "enabledOfShown": "{enabled} of {shown} shown models are in the chain",
+    "testColumn": "Test",
+    "testAll": "Test all",
+    "testAllHint": "Live probe against each visible, enabled provider — sequential with a short pause so free-tier limits are not burst.",
+    "testCta": "Test",
+    "testOkShort": "ok",
+    "testModel": "Test this model",
+    "testDisabledHint": "Model is off — turn it on to test.",
+    "testRunning": "Testing {done}/{total} …",
+    "testIdle": "Send a one-shot probe and check for non-empty reply text.",
+    "testPassed": "All providers answered.",
+    "testMixed": "Some providers failed — hover for details.",
+    "testProgress": "Testing …",
+    "testHint": "Per-provider live probe between Guardrails and Score.",
+    "testStop": "Stop",
+    "testStopHint": "Stop the remaining probes."
   },
   "strategies": {
     "explore": "Explore unmeasured models",

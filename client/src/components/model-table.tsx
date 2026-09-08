@@ -19,6 +19,7 @@ import {
   type RateLimitUsageRow,
   type Row,
 } from '@/lib/routing'
+// GroupTestCell + ModelTableHead use ModelTestState via dynamic import type on props
 
 // The unified model/provider table pieces, extracted from FallbackPage so the
 // Models page and the per-model detail page share one module.
@@ -89,8 +90,17 @@ function AxisRangeBar({ values, color }: { values: (number | undefined)[]; color
 
 // The shared table header for the unified model/provider table — used by the
 // Models page and the per-model detail page so their columns line up.
-export function ModelTableHead() {
+export function ModelTableHead({
+  onTestAll,
+  testAllDisabled,
+  testAllLabel,
+}: {
+  onTestAll?: () => void
+  testAllDisabled?: boolean
+  testAllLabel?: string
+} = {}) {
   const { t } = useI18n()
+  const hasTestAll = typeof onTestAll === 'function'
   return (
     <thead>
       <tr className="text-left text-muted-foreground border-b">
@@ -110,6 +120,24 @@ export function ModelTableHead() {
           <Tooltip text={t('strategies.guardrailsTooltip')}>
             <span className="underline decoration-dotted underline-offset-2 cursor-help">{t('strategies.guardrails')}</span>
           </Tooltip>
+        </th>
+        <th className="py-2 pr-2 text-center font-medium w-[84px]">
+          {hasTestAll ? (
+            <Tooltip text={t('models.testAllHint')}>
+              <button
+                type="button"
+                onClick={onTestAll}
+                disabled={!!testAllDisabled}
+                className="inline-flex items-center justify-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium bg-card hover:bg-muted disabled:opacity-40 disabled:cursor-not-allowed"
+                aria-label={t('models.testAll')}
+              >
+                <span aria-hidden>🧪</span>
+                {testAllLabel ?? t('models.testAll')}
+              </button>
+            </Tooltip>
+          ) : (
+            <span className="text-[11px]">{t('models.testColumn')}</span>
+          )}
         </th>
         <th className="py-2 pr-3 font-medium text-right">
           <Tooltip text={t('strategies.scoreTooltip')}>
@@ -247,6 +275,11 @@ export function RowContent({
       <td className="py-2 pr-3 align-middle font-mono text-[11px] text-muted-foreground tabular-nums">
         {guard < 0.999 ? `×${guard.toFixed(2)}` : '—'}
       </td>
+      {/* Live probe column — between Guardrails (×) and Score. */}
+      <td className="py-2 pr-2 align-middle text-center w-[84px]">
+        {/* Row-level probe is wired only on the group header; detail-page rows reuse RowTestCell there. */}
+        <span className="text-muted-foreground/30 text-[11px]">—</span>
+      </td>
       <td className="py-2 pr-3 align-middle text-right font-mono text-xs font-medium tabular-nums">
         {row.score !== undefined ? row.score.toFixed(3) : '–'}
       </td>
@@ -254,6 +287,97 @@ export function RowContent({
         <Switch checked={row.enabled} onCheckedChange={(c) => onToggle(row.modelDbId, c)} />
       </td>
     </>
+  )
+}
+
+// ── Live probe UI ──────────────────────────────────────────────────────────
+// One cell between Guardrails and Score. Each provider row would be noisy, so
+// the Models table exposes it on the logical-model header as one button that
+// walks every enabled member sequentially (the per-provider ticks live on the
+// detail page). States: idle (beaker), testing (spinner), ok (✓), error (✗).
+export function GroupTestCell({
+  members,
+  statesById,
+  onTest,
+  compact,
+}: {
+  members: readonly Row[]
+  statesById: ReadonlyMap<number, import('@/lib/model-test').ModelTestState>
+  onTest: (member: Row) => void
+  compact?: boolean
+}) {
+  const { t } = useI18n()
+  const enabledMembers = members.filter(m => m.enabled)
+  if (members.length === 0) return <span className="text-muted-foreground/20 text-[11px]">—</span>
+  if (enabledMembers.length === 0) {
+    return (
+      <Tooltip text={t('models.testDisabledHint')}>
+        <span className="inline-flex size-7 items-center justify-center rounded-md border text-muted-foreground/30 cursor-not-allowed">—</span>
+      </Tooltip>
+    )
+  }
+  const anyTesting = enabledMembers.some(m => statesById.get(m.modelDbId)?.status === 'testing')
+  const done = enabledMembers.filter(m => {
+    const s = statesById.get(m.modelDbId)?.status
+    return s === 'ok' || s === 'error'
+  }).length
+  const allOk = enabledMembers.length > 0 && enabledMembers.every(m => statesById.get(m.modelDbId)?.status === 'ok')
+  const anyError = enabledMembers.some(m => statesById.get(m.modelDbId)?.status === 'error')
+  const summaryKey = anyTesting ? 'models.testProgress' : allOk ? 'models.testPassed' : anyError ? 'models.testMixed' : 'models.testIdle'
+  // Build a readable tooltip from per-member results.
+  const detailLines = enabledMembers
+    .map(m => {
+      const st = statesById.get(m.modelDbId)
+      if (!st || st.status === 'idle' || st.status === 'testing') return null
+      const tag = st.status === 'ok' ? `✓ ${st.latencyMs ?? ''}ms`.trim() : `✗ ${st.error ?? ''}`.trim()
+      const label = (memberProviderLabel(m as any, members as any) ?? m.platform) as string
+      return `${label}: ${tag}${st.replyPreview ? ` — ${st.replyPreview}` : ''}`
+    })
+    .filter(Boolean)
+    .join('\n')
+  const tooltipText = anyTesting
+    ? t('models.testRunning', { done: String(done), total: String(enabledMembers.length) })
+    : detailLines || t(summaryKey as any) || t('models.testHint')
+  const onClick = () => {
+    const next = enabledMembers.find(m => {
+      const s = statesById.get(m.modelDbId)?.status
+      return s !== 'ok'
+    }) ?? enabledMembers[0]
+    if (!anyTesting) onTest(next)
+  }
+  return (
+    <Tooltip text={tooltipText}>
+      <button
+        type="button"
+        onClick={e => { e.stopPropagation(); onClick() }}
+        disabled={anyTesting}
+        aria-label={t('models.testModel')}
+        className={`inline-flex items-center justify-center gap-1 rounded-md border px-1.5 py-1 text-[11px] font-medium transition-colors disabled:opacity-60 disabled:cursor-not-allowed ${
+          anyTesting
+            ? 'bg-muted text-muted-foreground'
+            : allOk
+              ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/20'
+              : anyError && done === enabledMembers.length
+                ? 'bg-rose-500/10 text-rose-700 dark:text-rose-400 border-rose-500/20'
+                : anyError
+                  ? 'bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/20'
+                  : 'bg-card hover:bg-muted text-muted-foreground'
+        } ${compact ? 'size-7 p-0' : 'min-w-[3.25rem]'}`}
+      >
+        {anyTesting ? (
+          <>
+            <span className="size-3.5 animate-spin rounded-full border-2 border-current border-t-transparent" aria-hidden />
+            {!compact && <span className="tabular-nums">{done}/{enabledMembers.length}</span>}
+          </>
+        ) : allOk ? (
+          <><span aria-hidden>✓</span>{!compact && <span>{t('models.testOkShort')}</span>}</>
+        ) : anyError ? (
+          <><span aria-hidden>✗</span>{!compact && <span>{done}/{enabledMembers.length}</span>}</>
+        ) : (
+          <><span aria-hidden>🧪</span>{!compact && <span>{t('models.testCta')}</span>}</>
+        )}
+      </button>
+    </Tooltip>
   )
 }
 
@@ -361,6 +485,9 @@ export function GroupHeaderCells({ group, rank, dragHandle, onToggleGroup, allRo
       <td className="py-2 pr-3 align-middle">{measured.length === 0 ? <AxisNoData /> : <AxisRangeBar values={measured.map(m => m.speed)} color="#3b82f6" />}</td>
       <td className="py-2 pr-3 align-middle"><AxisRangeBar values={group.members.map(m => m.intelligence)} color="#a855f7" /></td>
       <td className="py-2 pr-3 align-middle font-mono text-[11px] text-muted-foreground tabular-nums">{guard < 0.999 ? `×${guard.toFixed(2)}` : '—'}</td>
+      <td className="py-2 pr-2 align-middle text-center w-[84px]" onClick={e => e.stopPropagation()}>
+        <GroupTestCell members={group.members} statesById={group.testStatesById ?? new Map()} onTest={group.onTestMember ?? (() => {})} />
+      </td>
       <td className="py-2 pr-3 align-middle text-right font-mono text-xs font-medium tabular-nums">
         {solo ? (
           best.score !== undefined ? best.score.toFixed(3) : '–'
