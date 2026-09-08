@@ -35,6 +35,26 @@ export interface LiveDiscoveryCounts {
   tombstoned: number;
 }
 
+/** Per-platform outcome of one sync run — what the operator actually needs to
+ *  answer "did it pull anything?". `pulled` is the reconciled roster size
+ *  (post free-filter, or full roster on manual admit-all); `addedIds` names
+ *  newly inserted models (capped) so "0 added" reads as "all N already known"
+ *  instead of "nothing happened". */
+export interface LivePlatformDetail {
+  platform: string;
+  status: 'ok' | 'skipped' | 'failed';
+  pulled: number;
+  added: number;
+  reinstated: number;
+  deprecated: number;
+  skipped: number;
+  paidSkipped: number;
+  tombstoned: number;
+  addedIds: string[];
+  error?: string;
+  skipReason?: string;
+}
+
 export interface LiveDiscoveryResult {
   ok: boolean;
   platforms: string[];
@@ -42,6 +62,8 @@ export interface LiveDiscoveryResult {
   failures: Array<{ platform: string; error: string }>;
   fingerprint: string;
   durationMs: number;
+  /** One entry per attempted platform, in run order. Additive — older clients ignore it. */
+  details: LivePlatformDetail[];
 }
 
 export interface LiveDiscoveryState {
@@ -147,6 +169,8 @@ interface CollectorOutput {
   /** True when the platform was not attempted at all (no compatible provider
    *  or no usable key) — the run skips it without recording a failure. */
   notAttempted?: boolean;
+  /** Machine-readable skip cause for the per-platform detail row. */
+  skipReason?: string;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -455,15 +479,15 @@ function filterFreeModels(platform: string, entries: ListedChatModel[], admitAll
  *  BaseProvider-default check skip providers whose adapter has not landed yet.
  *  One platform's failure is isolated and never disables rows. */
 async function fetchKeyedPlatformModels(db: Db, platform: string, admitAll = false): Promise<CollectorOutput> {
-  const notAttempted: CollectorOutput = { models: [], paidSkipped: 0, notAttempted: true };
+  const skip = (reason: string): CollectorOutput => ({ models: [], paidSkipped: 0, notAttempted: true, skipReason: reason });
   const rule = LIVE_PROBE_RULES[platform];
-  if (!rule && !admitAll) return notAttempted;
+  if (!rule && !admitAll) return skip('excluded-by-free-filter');
   const effectiveRule = rule ?? { patterns: ['*'] };
   let provider: unknown;
   try {
     provider = getProvider(platform as Platform);
   } catch {
-    return notAttempted;
+    return skip('no-provider');
   }
   const listChatModels = (provider as { listChatModels?: unknown }).listChatModels;
   // The typeof guard alone is not enough: BaseProvider ships a default
@@ -472,7 +496,8 @@ async function fetchKeyedPlatformModels(db: Db, platform: string, admitAll = fal
   // override (or a test double's own function) takes the listing path.
   const hasListing = typeof listChatModels === 'function'
     && listChatModels !== BaseProvider.prototype.listChatModels;
-  if (!hasListing) return notAttempted;
+  if (!hasListing) return skip('no-listing');
+  if (!effectiveRule.keyless && listUsableKeyRows(db, platform).length === 0) return skip('no-usable-key');
   return fetchViaListChatModels(db, platform, effectiveRule, provider as object, listChatModels as ListChatModelsFn, admitAll);
 }
 
@@ -685,11 +710,25 @@ export async function runLiveModelSync(db: Db): Promise<LiveDiscoveryResult> {
 /** Shared core: reconcile exactly the given platforms. No catalog fetch, no
  *  license check — pure provider-roster truth. `admitAll` (manual single
  *  sync) reconciles the full roster instead of only the free subset. */
+/** Cap on named ids per platform detail — bounds the persisted settings JSON. */
+const MAX_ADDED_IDS = 25;
+
 async function syncPlatforms(db: Db, platforms: string[], opts: { admitAll?: boolean } = {}): Promise<LiveDiscoveryResult> {
   const startedAt = Date.now();
   const counts: LiveDiscoveryCounts = { added: 0, reinstated: 0, deprecated: 0, skipped: 0, paidSkipped: 0, tombstoned: 0 };
   const failures: Array<{ platform: string; error: string }> = [];
   const seen: Record<string, string[]> = {};
+  const details: LivePlatformDetail[] = [];
+
+  const snapshot = (): LiveDiscoveryCounts => ({ ...counts });
+  const delta = (before: LiveDiscoveryCounts): LiveDiscoveryCounts => ({
+    added: counts.added - before.added,
+    reinstated: counts.reinstated - before.reinstated,
+    deprecated: counts.deprecated - before.deprecated,
+    skipped: counts.skipped - before.skipped,
+    paidSkipped: counts.paidSkipped - before.paidSkipped,
+    tombstoned: counts.tombstoned - before.tombstoned,
+  });
 
   try {
     for (const platform of platforms) {
@@ -698,15 +737,42 @@ async function syncPlatforms(db: Db, platforms: string[], opts: { admitAll?: boo
           ? await fetchOpenRouterModels()
           : await fetchKeyedPlatformModels(db, platform, opts.admitAll === true);
         counts.paidSkipped += out.paidSkipped;
-        if (out.notAttempted) continue;
+        if (out.notAttempted) {
+          details.push({
+            platform, status: 'skipped', pulled: 0,
+            added: 0, reinstated: 0, deprecated: 0, skipped: 0,
+            paidSkipped: out.paidSkipped, tombstoned: 0, addedIds: [],
+            skipReason: out.skipReason ?? 'not-attempted',
+          });
+          continue;
+        }
         // An empty list is inconclusive, never evidence of removal.
         if (out.models.length === 0) throw new Error(platform + ' returned an empty model list');
+        // Ids not already present become the visible "added" proof.
+        const knownIds = new Set(
+          (db.prepare('SELECT model_id FROM models WHERE platform = ?').all(platform) as Array<{ model_id: string }>)
+            .map(r => r.model_id),
+        );
+        const addedIds = out.models.map(m => m.id).filter(id => !knownIds.has(id)).slice(0, MAX_ADDED_IDS);
+        const before = snapshot();
         seen[platform] = out.models.map(m => m.id);
         applyPlatformModels(db, platform, out.models, counts);
         deprecateMissingLiveModels(db, platform, new Set(seen[platform]), counts);
+        const d = delta(before);
+        details.push({
+          platform, status: 'ok', pulled: out.models.length,
+          added: d.added, reinstated: d.reinstated, deprecated: d.deprecated,
+          skipped: d.skipped, paidSkipped: out.paidSkipped, tombstoned: d.tombstoned,
+          addedIds,
+        });
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         failures.push({ platform, error: message });
+        details.push({
+          platform, status: 'failed', pulled: 0,
+          added: 0, reinstated: 0, deprecated: 0, skipped: 0,
+          paidSkipped: 0, tombstoned: 0, addedIds: [], error: message,
+        });
         console.error(`[live-model-sync] ${platform}: ${message}`);
       }
     }
@@ -720,14 +786,16 @@ async function syncPlatforms(db: Db, platforms: string[], opts: { admitAll?: boo
       failures,
       fingerprint: fingerprintSeen(seen),
       durationMs: Date.now() - startedAt,
+      details,
     };
 
     lastRunMs = startedAt;
     lastError = error;
     lastResult = result;
     persistSettings(startedAt, result, error);
+    const pulled = details.reduce((n, d) => n + d.pulled, 0);
     console.log(
-      `[live-model-sync] ok=${ok} added=${counts.added} reinstated=${counts.reinstated} ` +
+      `[live-model-sync] ok=${ok} pulled=${pulled} added=${counts.added} reinstated=${counts.reinstated} ` +
       `deprecated=${counts.deprecated} skipped=${counts.skipped} paidSkipped=${counts.paidSkipped} ` +
       `tombstoned=${counts.tombstoned} failures=${failures.length}`,
     );
@@ -741,6 +809,7 @@ async function syncPlatforms(db: Db, platforms: string[], opts: { admitAll?: boo
       failures: [...failures, { platform: '*', error: message }],
       fingerprint: fingerprintSeen(seen),
       durationMs: Date.now() - startedAt,
+      details,
     };
     lastRunMs = startedAt;
     lastError = message;

@@ -620,7 +620,12 @@
     "liveSyncSuccess": "Live sync: {added} added, {deprecated} deprecated ({platforms})",
     "liveSyncSuccessAll": "Live sync: {added} added, {deprecated} deprecated across {platforms} providers",
     "liveSyncFailed": "Live sync failed: {reason}",
-    "liveSyncNoKeys": "No usable key for this provider — add and validate a key first."
+    "liveSyncNoKeys": "No usable key for this provider — add and validate a key first.",
+    "liveSyncPulled": "{pulled} pulled",
+    "liveSyncKnown": "{skipped} already known",
+    "liveSyncPaidSkipped": "{count} filtered (paid)",
+    "liveSyncFailures": "Failed: {list}",
+    "liveSyncSkippedPlatforms": "{count} skipped ({reasons})"
   },
   "backups": {
     "title": "Backups",
