@@ -28,6 +28,21 @@ export interface LiveDiscoveryCounts {
   tombstoned: number
 }
 
+export interface LivePlatformDetail {
+  platform: string
+  status: 'ok' | 'skipped' | 'failed'
+  pulled: number
+  added: number
+  reinstated: number
+  deprecated: number
+  skipped: number
+  paidSkipped: number
+  tombstoned: number
+  addedIds: string[]
+  error?: string
+  skipReason?: string
+}
+
 export interface LiveDiscoveryResult {
   ok: boolean
   platforms: string[]
@@ -35,6 +50,7 @@ export interface LiveDiscoveryResult {
   failures: Array<{ platform: string; error: string }>
   fingerprint: string
   durationMs: number
+  details?: LivePlatformDetail[]
 }
 
 export interface LiveDiscoveryState {

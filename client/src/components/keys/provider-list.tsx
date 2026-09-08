@@ -164,23 +164,56 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
     }
     queryClient.invalidateQueries({ queryKey: ['fallback', 'routing'] })
   }
-  const liveSyncSummary = (data: { counts?: { added?: number; deprecated?: number }; platforms?: string[] }, all: boolean) => {
+  interface LiveSyncPayload {
+    counts?: { added?: number; reinstated?: number; deprecated?: number; skipped?: number; paidSkipped?: number }
+    platforms?: string[]
+    failures?: Array<{ platform: string; error: string }>
+    details?: Array<{
+      platform: string; status: 'ok' | 'skipped' | 'failed'; pulled: number
+      added: number; reinstated: number; deprecated: number; skipped: number
+      paidSkipped: number; addedIds: string[]; error?: string; skipReason?: string
+    }>
+  }
+  // Rich summary so "0 added" is explainable: pulled vs already-known vs
+  // filtered vs failed. Full payload also goes to the console for inspection.
+  const liveSyncSummary = (data: LiveSyncPayload, all: boolean) => {
+    const detail = !all ? data?.details?.[0] : undefined
+    if (detail) {
+      const parts = [
+        t('keys.liveSyncPulled', { pulled: detail.pulled }),
+        `${detail.added} added`,
+      ]
+      if (detail.reinstated > 0) parts.push(`${detail.reinstated} reinstated`)
+      if (detail.skipped > 0) parts.push(t('keys.liveSyncKnown', { skipped: detail.skipped }))
+      if (detail.deprecated > 0) parts.push(`${detail.deprecated} deprecated`)
+      if (detail.paidSkipped > 0) parts.push(t('keys.liveSyncPaidSkipped', { count: detail.paidSkipped }))
+      let suffix = detail.addedIds.length > 0 ? ` — ${detail.addedIds.slice(0, 5).join(', ')}${detail.addedIds.length > 5 ? ', …' : ''}` : ''
+      if (detail.status === 'skipped') suffix += ` (${detail.skipReason ?? 'skipped'})`
+      return `${detail.platform}: ${parts.join(' · ')}${suffix}`
+    }
+    const pulled = (data?.details ?? []).reduce((n, d) => n + (d.pulled ?? 0), 0)
     const added = data?.counts?.added ?? 0
     const deprecated = data?.counts?.deprecated ?? 0
-    const platforms = (data?.platforms ?? []).join(', ')
-    return all
-      ? t('keys.liveSyncSuccessAll', { added, deprecated, platforms: data?.platforms?.length ?? 0 })
-      : t('keys.liveSyncSuccess', { added, deprecated, platforms: platforms || '—' })
+    const skipped = (data?.details ?? []).filter(d => d.status === 'skipped').length
+    const failures = (data?.failures ?? []).map(f => `${f.platform}: ${f.error}`)
+    let msg = t('keys.liveSyncSuccessAll', { added, deprecated, platforms: data?.platforms?.length ?? 0 })
+    const extra: string[] = []
+    if (pulled > 0) extra.push(t('keys.liveSyncPulled', { pulled }))
+    if (skipped > 0) extra.push(t('keys.liveSyncSkippedPlatforms', { count: skipped, reasons: 'no key/listing' }))
+    if (failures.length > 0) extra.push(t('keys.liveSyncFailures', { list: failures.slice(0, 3).join(' · ') + (failures.length > 3 ? ' · …' : '') }))
+    if (extra.length > 0) msg += ` — ${extra.join(' · ')}`
+    return msg
   }
   const syncProviderLive = useMutation({
     meta: { silenceToast: true },
     mutationFn: (platform: string) =>
-      apiFetch<{ counts?: { added?: number; deprecated?: number }; platforms?: string[] }>(
+      apiFetch<LiveSyncPayload>(
         `/api/keys/live-sync/${encodeURIComponent(platform)}`,
         { method: 'POST' },
       ),
     onSuccess: (data) => {
       invalidateAfterLiveSync()
+      try { console.info('[live-sync]', data) } catch { /* ignore */ }
       toast.success(liveSyncSummary(data, false))
     },
     onError: (error) => {
@@ -190,12 +223,13 @@ export function ProviderList({ onAddKey }: { onAddKey: () => void }) {
   const syncAllLive = useMutation({
     meta: { silenceToast: true },
     mutationFn: () =>
-      apiFetch<{ counts?: { added?: number; deprecated?: number }; platforms?: string[] }>(
+      apiFetch<LiveSyncPayload>(
         '/api/keys/live-sync',
         { method: 'POST' },
       ),
     onSuccess: (data) => {
       invalidateAfterLiveSync()
+      try { console.info('[live-sync]', data) } catch { /* ignore */ }
       toast.success(liveSyncSummary(data, true))
     },
     onError: (error) => {
