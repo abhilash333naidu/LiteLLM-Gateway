@@ -1,12 +1,15 @@
 import { getDb } from '../db/index.js';
 import { getProvider, hasProvider } from '../providers/index.js';
-import { routeRequest, type ChainRow } from './router.js';
+import { routeRequest, RouteError, type ChainRow } from './router.js';
 import { contentToString } from '../lib/content.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import type { Platform } from '@freellmapi/shared/types.js';
 
 export const MODEL_TEST_TIMEOUT_MS = 15_000;
-export const MODEL_TEST_MAX_TOKENS = 16;
+// 16 output tokens starve reasoning models: they spend the whole budget on the
+// hidden trace (finish_reason length, empty content) while answering fine in
+// chat. 256 leaves room for think + the one-word answer.
+export const MODEL_TEST_MAX_TOKENS = 256;
 
 export interface ModelTestResult {
   modelDbId: number;
@@ -66,24 +69,29 @@ export async function testSingleModel(
 
   // Use routeRequest with a single-entry chain so only this model is eligible.
   // estimatedTokens 20 is enough for the tiny probe; 0 reserve keeps the check lenient.
-  const route = routeRequest(
-    20, // estimatedTokens
-    undefined, // skipKeys
-    undefined, // preferredModelDbId — not used when chain is single-entry
-    false, // requireVision
-    false, // requireTools
-    undefined, // skipModels
-    [full], // prefetchedChain — pin to this one row
-    false, // requireStructured
-    undefined, // skipPlatforms
-    0, // exactOutputReserve
-  );
-
-  if (!route) {
-    throw Object.assign(new Error('no usable key for this model (rate-limited, cooldown, token-budget, or no healthy key)'), {
-      status: 503,
-      code: 'no_usable_key',
-    });
+  // NOTE: routeRequest THROWS RouteError on exhaustion (never returns null).
+  let route: Awaited<ReturnType<typeof routeRequest>>;
+  try {
+    route = routeRequest(
+      20, // estimatedTokens
+      undefined, // skipKeys
+      undefined, // preferredModelDbId — not used when chain is single-entry
+      false, // requireVision
+      false, // requireTools
+      undefined, // skipModels
+      [full], // prefetchedChain — pin to this one row
+      false, // requireStructured
+      undefined, // skipPlatforms
+      0, // exactOutputReserve
+    );
+  } catch (err: any) {
+    if (err instanceof RouteError) {
+      throw Object.assign(
+        new Error(`no usable key for this model (${(err.diagnostics ?? []).join('; ') || err.message})`),
+        { status: 503, code: 'no_usable_key' },
+      );
+    }
+    throw err;
   }
 
   const provider = getProvider(route.platform as Platform) ?? route.provider;
@@ -108,10 +116,18 @@ export async function testSingleModel(
       undefined,
     );
     const latencyMs = Date.now() - t0;
-    const raw = (res as any)?.choices?.[0]?.message?.content ?? (res as any)?.choices?.[0]?.text ?? '';
+    const msgOut = (res as any)?.choices?.[0]?.message ?? {};
+    const raw = msgOut?.content ?? (res as any)?.choices?.[0]?.text ?? '';
     const text = contentToString(raw).trim();
-    const replyPreview = text.slice(0, 120);
-    if (text.length > 0) {
+    // Reasoning/thinking models may answer with an empty content but a
+    // populated trace (reasoning_content / reasoning) — that still proves the
+    // model served the request, so it counts as a pass. Adapters without the
+    // openai-compat reasoning fold (cloudflare/cohere/aihorde/google) need this.
+    const reasoning = [msgOut?.reasoning_content, msgOut?.reasoning]
+      .filter((r): r is string => typeof r === 'string' && r.trim().length > 0)
+      .join('\n');
+    const replyPreview = (text || reasoning).slice(0, 120);
+    if (text.length > 0 || reasoning.length > 0) {
       return { modelDbId, modelId: route.modelId, platform: route.platform, ok: true, latencyMs, replyPreview };
     }
     return {
@@ -127,15 +143,25 @@ export async function testSingleModel(
     const latencyMs = Date.now() - t0;
     const msg = sanitizeProviderErrorMessage(err?.message ?? String(err));
     const sanitized = msg || 'upstream_error';
-    // Preserve upstream status as a hint when it's handy.
+    // Preserve upstream status as a hint when it's handy — EXCEPT 401: the
+    // dashboard logs out on ANY 401, and an upstream bad-key 401 is not a
+    // session failure. Report it as 502 so one revoked provider key can't
+    // nuke the operator's session mid Test-All.
+    const upstreamStatus = err?.status && err.status >= 400 ? err.status : 502;
+    const status = upstreamStatus === 401 ? 502 : upstreamStatus;
     const code = err?.status ? `${sanitized} (${err.status})` : sanitized;
-    // Re-throw as a typed 502 so the route handler serializes a clean body.
+    // Re-throw as a typed error so the route handler serializes a clean body.
     const e: any = new Error(code);
-    e.status = err?.status && err.status >= 400 ? err.status : 502;
+    e.status = status;
     e.code = 'upstream_error';
     e.latencyMs = latencyMs;
     e.platform = route.platform;
     e.modelId = route.modelId;
     throw e;
+  } finally {
+    // selectKeyForModel took an in-flight lease for this probe; production
+    // loops release it, and so must we — otherwise every probe benches its key
+    // (concurrency/TPM gates) for up to the 120s lease age-out.
+    route.release?.();
   }
 }

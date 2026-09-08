@@ -42,7 +42,7 @@ import type { BaseProvider } from '../providers/base.js';
 import type { Platform } from '@freellmapi/shared/types.js';
 import type { Db } from '../db/types.js';
 
-class RouteError extends Error {
+export class RouteError extends Error {
   status: number;
   // Per-model disposition of the chain at the moment routing gave up: one line
   // per considered model with the reason it could not serve (no key, cooldown,

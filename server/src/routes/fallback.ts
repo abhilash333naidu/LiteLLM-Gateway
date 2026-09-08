@@ -674,7 +674,10 @@ fallbackRouter.get('/rate-limit-usage', (_req: Request, res: Response) => {
 // and succeeds only on non-empty reply text. Used for the per-model test icon
 // and the bulk "Test All" over visible+enabled rows. Rate-limited to avoid
 // bursting free-tier RPMs from the dashboard.
-const MODEL_TEST_RATE_LIMIT_RPM = Number(process.env.MODEL_TEST_RATE_LIMIT_RPM ?? 30);
+// 120/min: the dashboard spaces bulk probes ~900ms apart (≤ ~66/min even with
+// instant providers), so this never clips a legitimate Test-All tail while
+// still throttling a runaway client far below the 600/min admin default.
+const MODEL_TEST_RATE_LIMIT_RPM = Number(process.env.MODEL_TEST_RATE_LIMIT_RPM ?? 120);
 const modelTestLimiter = createAdminRateLimiter(MODEL_TEST_RATE_LIMIT_RPM);
 
 fallbackRouter.post('/test', modelTestLimiter, async (req: Request, res: Response) => {
@@ -688,7 +691,11 @@ fallbackRouter.post('/test', modelTestLimiter, async (req: Request, res: Respons
     const result = await testSingleModel(parsed.data.modelDbId, { signal: (req as any).signal } as any);
     res.json(result);
   } catch (e: any) {
-    const status = Number.isFinite(e?.status) ? e.status : 502;
+    let status = Number.isFinite(e?.status) ? e.status : 502;
+    // Belt-and-braces with model-test.ts: this endpoint must NEVER emit 401 —
+    // the dashboard logs out on any 401, and an upstream bad-key 401 is not a
+    // session failure.
+    if (status === 401) status = 502;
     const latencyMs = e?.latencyMs;
     res.status(status).json({
       error: { message: e?.message ?? 'upstream_error', code: e?.code ?? 'upstream_error' },
