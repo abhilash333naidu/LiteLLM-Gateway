@@ -94,13 +94,20 @@ export function ModelTableHead({
   onTestAll,
   testAllDisabled,
   testAllLabel,
+  onTestAndDisable,
+  testAndDisableDisabled,
+  testAndDisableLabel,
 }: {
   onTestAll?: () => void
   testAllDisabled?: boolean
   testAllLabel?: string
+  onTestAndDisable?: () => void
+  testAndDisableDisabled?: boolean
+  testAndDisableLabel?: string
 } = {}) {
   const { t } = useI18n()
   const hasTestAll = typeof onTestAll === 'function'
+  const hasTestAndDisable = typeof onTestAndDisable === 'function'
   return (
     <thead>
       <tr className="text-left text-muted-foreground border-b">
@@ -121,20 +128,36 @@ export function ModelTableHead({
             <span className="underline decoration-dotted underline-offset-2 cursor-help">{t('strategies.guardrails')}</span>
           </Tooltip>
         </th>
-        <th className="py-2 pr-2 text-center font-medium w-[84px]">
+        <th className="py-2 pr-2 text-center font-medium w-[220px]">
           {hasTestAll ? (
-            <Tooltip text={t('models.testAllHint')}>
-              <button
-                type="button"
-                onClick={onTestAll}
-                disabled={!!testAllDisabled}
-                className="inline-flex items-center justify-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium bg-card hover:bg-muted disabled:opacity-40 disabled:cursor-not-allowed"
-                aria-label={t('models.testAll')}
-              >
-                <span aria-hidden>🧪</span>
-                {testAllLabel ?? t('models.testAll')}
-              </button>
-            </Tooltip>
+            <span className="inline-flex gap-1 justify-center">
+              <Tooltip text={t('models.testAllHint')}>
+                <button
+                  type="button"
+                  onClick={onTestAll}
+                  disabled={!!testAllDisabled}
+                  className="inline-flex items-center justify-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium bg-card hover:bg-muted disabled:opacity-40 disabled:cursor-not-allowed"
+                  aria-label={t('models.testAll')}
+                >
+                  <span aria-hidden>🧪</span>
+                  {testAllLabel ?? t('models.testAll')}
+                </button>
+              </Tooltip>
+              {hasTestAndDisable ? (
+                <Tooltip text={t('models.testAndDisableHint')}>
+                  <button
+                    type="button"
+                    onClick={onTestAndDisable}
+                    disabled={!!testAndDisableDisabled}
+                    className="inline-flex items-center justify-center gap-1 rounded-md border px-2 py-1 text-[11px] font-medium bg-card hover:bg-muted disabled:opacity-40 disabled:cursor-not-allowed"
+                    aria-label={t('models.testAndDisable')}
+                  >
+                    <span aria-hidden>🧪🚫</span>
+                    {testAndDisableLabel ?? t('models.testAndDisable')}
+                  </button>
+                </Tooltip>
+              ) : null}
+            </span>
           ) : (
             <span className="text-[11px]">{t('models.testColumn')}</span>
           )}
