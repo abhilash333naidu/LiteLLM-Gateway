@@ -39,13 +39,17 @@ export async function apiFetch<T>(path: string, options?: RequestInit): Promise<
     ...options,
     headers,
   });
-  if (res.status === 401) {
-    // Session missing/expired — drop the token and let the AuthGate re-render.
-    clearToken();
-    window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
-  }
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: { message: res.statusText } }));
+    if (res.status === 401 && (body.error?.type === undefined || body.error?.type === 'authentication_error')) {
+      // Session missing/expired — drop the token and let the AuthGate
+      // re-render. Typed 401s from OTHER causes (e.g. an upstream provider
+      // rejecting a key, proxied through /api/fallback/test as
+      // `upstream_error`) must NOT log out: one revoked provider key would
+      // otherwise nuke the operator's session mid Test-All.
+      clearToken();
+      window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
+    }
     // Surface the HTTP status and the machine-readable error type on the thrown
     // Error so callers can branch on them (e.g. the setup form reveals a code
     // field on a `setup_code_required` 403). `.message` behaviour is unchanged.
