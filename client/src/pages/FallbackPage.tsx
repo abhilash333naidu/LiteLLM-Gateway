@@ -233,10 +233,20 @@ export default function FallbackPage() {
   })
   const draggable = isManual && !filtersActive
 
+  // Disabled section (slice 1, display-only): groups where NO member is
+  // enabled sink to a bottom section; enabled groups (any member on, incl.
+  // half-off mixed) stay on top in true chain order. Saved priorities and
+  // probe/bulk/save paths still read visibleGroups untouched.
+  const enabledGroups = visibleGroups.filter(g => g.members.some(m => m.enabled))
+  const disabledGroups = visibleGroups.filter(g => !g.members.some(m => m.enabled))
+
   // Progressive rendering: grow the row budget whenever the sentinel below the
-  // table scrolls near the viewport (drag autoscroll extends it too).
+  // table scrolls near the viewport (drag autoscroll extends it too). The
+  // budget fills enabled rows first, then disabled rows with the remainder.
   const [renderLimit, setRenderLimit] = useState(RENDER_CHUNK)
-  const renderedGroups = visibleGroups.slice(0, renderLimit)
+  const renderedEnabledGroups = enabledGroups.slice(0, renderLimit)
+  const renderedDisabledGroups = disabledGroups.slice(0, Math.max(0, renderLimit - renderedEnabledGroups.length))
+  const renderedGroups = [...renderedEnabledGroups, ...renderedDisabledGroups]
   const hasMoreRows = visibleGroups.length > renderLimit
   const sentinelRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
@@ -457,6 +467,10 @@ export default function FallbackPage() {
       onTestGroup: () => { void handleTestGroup(g) },
     }))
   }, [renderedGroups, testStates, handleTestMember, handleTestGroup])
+  // renderedGroups is [enabled..., disabled...], so slicing the decorated
+  // list at the enabled boundary yields both sections with handlers intact.
+  const decoratedEnabledGroups = decoratedGroups.slice(0, renderedEnabledGroups.length)
+  const decoratedDisabledGroups = decoratedGroups.slice(renderedEnabledGroups.length)
   // Header Test-All label reflects the run state (#1150).
   const testingVisibleTotal = visibleGroups.flatMap(g => g.members.filter(m => m.enabled)).length
   const testedVisibleCount = visibleGroups.flatMap(g => g.members.filter(m => {
@@ -494,13 +508,22 @@ export default function FallbackPage() {
 
   // Reorder models (the failover priority order). Providers within a model are
   // ordered by the active strategy and managed on the model's own page.
+  // Drag resolves within the ENABLED ordered list only: disabled groups sit
+  // sunk at the bottom of the display, so persisting display indices would
+  // serialize the sunk order and silently rewrite failover priorities (and a
+  // raw arrayMove over orderedGroups could promote a disabled group). The
+  // full order is reconstructed as reordered enabled + disabled in original
+  // relative order before persistGroupOrder flattens to priority 1..N.
   function handleGroupedDragEnd(event: DragEndEvent) {
     const { active, over } = event
     if (!over || active.id === over.id) return
-    const oldI = orderedGroups.findIndex(g => `grp:${g.key}` === String(active.id))
-    const newI = orderedGroups.findIndex(g => `grp:${g.key}` === String(over.id))
+    const enabledOrdered = orderedGroups.filter(g => g.members.some(m => m.enabled))
+    const oldI = enabledOrdered.findIndex(g => `grp:${g.key}` === String(active.id))
+    const newI = enabledOrdered.findIndex(g => `grp:${g.key}` === String(over.id))
     if (oldI < 0 || newI < 0) return
-    persistGroupOrder(arrayMove(orderedGroups, oldI, newI))
+    const reorderedEnabled = arrayMove(enabledOrdered, oldI, newI)
+    const disabledOrdered = orderedGroups.filter(g => !g.members.some(m => m.enabled))
+    persistGroupOrder([...reorderedEnabled, ...disabledOrdered])
   }
 
   return (
@@ -769,10 +792,27 @@ export default function FallbackPage() {
                       testAndDisableDisabled={testAndDisableDisabled}
                       testAndDisableLabel={testAndDisableLabel}
                     />
-                    <SortableContext items={decoratedGroups.map(g => `grp:${g.key}`)} strategy={verticalListSortingStrategy}>
+                    <SortableContext items={decoratedEnabledGroups.map(g => `grp:${g.key}`)} strategy={verticalListSortingStrategy}>
                       <tbody>
-                        {decoratedGroups.map(g => (
+                        {decoratedEnabledGroups.map(g => (
                           <SortableGroupRow key={g.key} group={g as any} rank={rankByKey.get(g.key) ?? 0} onToggleGroup={handleGroupToggle} allRows={rows} rateUsage={rateUsageByModel} />
+                        ))}
+                        {decoratedDisabledGroups.length > 0 && (
+                          <tr className="border-b last:border-0">
+                            <td colSpan={10} className="px-3 py-2 text-xs text-muted-foreground">
+                              <span className="font-medium">{t('models.disabledSectionTitle', { count: disabledGroups.length })}</span>
+                              <span className="ml-2">{t('models.disabledSectionHint')}</span>
+                            </td>
+                          </tr>
+                        )}
+                        {decoratedDisabledGroups.map(g => (
+                          <tr
+                            key={g.key}
+                            onClick={() => navigate(`/models/chat/${encodeURIComponent(g.members[0].canonicalId ?? g.members[0].modelId)}`)}
+                            className="group/row border-b last:border-0 cursor-pointer transition-colors hover:[&>td]:bg-muted/50 [&>td:first-child]:rounded-l-lg [&>td:last-child]:rounded-r-lg opacity-50"
+                          >
+                            <GroupHeaderCells group={g as any} rank={rankByKey.get(g.key) ?? 0} onToggleGroup={handleGroupToggle} allRows={rows} rateUsage={rateUsageByModel} />
+                          </tr>
                         ))}
                       </tbody>
                     </SortableContext>
@@ -791,11 +831,28 @@ export default function FallbackPage() {
                     testAndDisableLabel={testAndDisableLabel}
                   />
                   <tbody>
-                    {decoratedGroups.map(g => (
+                    {decoratedEnabledGroups.map(g => (
                       <tr
                         key={g.key}
                         onClick={() => navigate(`/models/chat/${encodeURIComponent(g.members[0].canonicalId ?? g.members[0].modelId)}`)}
-                        className={`group/row border-b last:border-0 cursor-pointer transition-colors hover:[&>td]:bg-muted/50 [&>td:first-child]:rounded-l-lg [&>td:last-child]:rounded-r-lg ${g.members.some(m => m.enabled) ? '' : 'opacity-50'}`}
+                        className="group/row border-b last:border-0 cursor-pointer transition-colors hover:[&>td]:bg-muted/50 [&>td:first-child]:rounded-l-lg [&>td:last-child]:rounded-r-lg"
+                      >
+                        <GroupHeaderCells group={g as any} rank={rankByKey.get(g.key) ?? 0} onToggleGroup={handleGroupToggle} allRows={rows} rateUsage={rateUsageByModel} />
+                      </tr>
+                    ))}
+                    {decoratedDisabledGroups.length > 0 && (
+                      <tr className="border-b last:border-0">
+                        <td colSpan={10} className="px-3 py-2 text-xs text-muted-foreground">
+                          <span className="font-medium">{t('models.disabledSectionTitle', { count: disabledGroups.length })}</span>
+                          <span className="ml-2">{t('models.disabledSectionHint')}</span>
+                        </td>
+                      </tr>
+                    )}
+                    {decoratedDisabledGroups.map(g => (
+                      <tr
+                        key={g.key}
+                        onClick={() => navigate(`/models/chat/${encodeURIComponent(g.members[0].canonicalId ?? g.members[0].modelId)}`)}
+                        className="group/row border-b last:border-0 cursor-pointer transition-colors hover:[&>td]:bg-muted/50 [&>td:first-child]:rounded-l-lg [&>td:last-child]:rounded-r-lg opacity-50"
                       >
                         <GroupHeaderCells group={g as any} rank={rankByKey.get(g.key) ?? 0} onToggleGroup={handleGroupToggle} allRows={rows} rateUsage={rateUsageByModel} />
                       </tr>
