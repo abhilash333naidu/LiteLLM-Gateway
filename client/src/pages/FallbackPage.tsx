@@ -418,11 +418,23 @@ export default function FallbackPage() {
         return false
       }
     }
-    const failedIds = new Set<number>()
     for (let i = 0; i < uniq.length; i++) {
       if (ac.signal.aborted) break
       const ok = await probeAndTrack(uniq[i])
-      if (ok === false && !ac.signal.aborted) failedIds.add(uniq[i])
+      if (ok === false) {
+        // Stage this failure off immediately: the switch flips in real time
+        // and survives a mid-run Stop. probeAndTrack returns null (not false)
+        // on abort, so aborted probes never land here. Functional update
+        // avoids the stale `allEntries` closure over a long async loop.
+        const failedId = uniq[i]
+        setStaged(prev => {
+          const base = prev && prev.profileId === activeProfileId ? prev.entries : entries
+          return {
+            profileId: activeProfileId,
+            entries: base.map(e => (e.modelDbId === failedId ? { ...e, enabled: false } : e)),
+          }
+        })
+      }
       if (i < uniq.length - 1 && !ac.signal.aborted) {
         await new Promise<void>(resolve => {
           const t = setTimeout(resolve, MODEL_TEST_GAP_MS)
@@ -430,13 +442,9 @@ export default function FallbackPage() {
         })
       }
     }
-    if (!ac.signal.aborted && failedIds.size > 0) {
-      const failed = new Set(failedIds)
-      setStaged({ profileId: activeProfileId, entries: allEntries.map(e => (failed.has(e.modelDbId) ? { ...e, enabled: false } : e)) })
-    }
     testDisableRef.current = false
     bulkAbortRef.current = null
-  }, [visibleGroups, allEntries, activeProfileId, setTestState])
+  }, [visibleGroups, entries, activeProfileId, setTestState])
 
   // Decorate rendered groups with probe state/handlers so the shared row cell
   // doesn't need its own prop plumbing change in two places.

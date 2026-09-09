@@ -11,10 +11,10 @@ import type { ModelTestState } from '../../lib/model-test'
 // fallback-probe.test.ts:
 //
 //   FallbackPage.tsx lines referenced below: handleTestAndDisable (visible+
-//   enabled + dedup + probeAndTrack ok/false/null + abort guard +
-//   failedIds.size > 0 staging via setStaged/allEntries.map), stop branch
-//   (bulkAbortRef abort + testDisableRef reset + testing-only spinner
-//   clear), Save payload (handleSave map to {modelDbId,priority,enabled}).
+//   enabled + dedup + probeAndTrack ok/false/null + REAL-TIME per-failure
+//   staging via functional setStaged(prev => …) with staged-vs-server base),
+//   stop branch (bulkAbortRef abort + testDisableRef reset + testing-only
+//   spinner clear), Save payload (handleSave map to {modelDbId,priority,enabled}).
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const page = readFileSync(path.join(here, '../FallbackPage.tsx'), 'utf8')
@@ -33,15 +33,33 @@ function selectTestAndDisableIds(visibleGroups: Group[]): number[] {
   return [...new Set(ids)]
 }
 
-// ── Mirror of the staging step: failed off, everything else untouched ──
+// ── Mirror of the real-time staging step: each failure stages off
+// immediately, everything else untouched ──
 function stageFailedOff(allEntries: Entry[], failedIds: Set<number>): Entry[] {
   const failed = new Set(failedIds)
   return allEntries.map(e => (failed.has(e.modelDbId) ? { ...e, enabled: false } : e))
 }
 
-// ── Mirror of the staging guard: only stage when not aborted + failures ──
-function shouldStage(signalAborted: boolean, failedSize: number): boolean {
-  return !signalAborted && failedSize > 0
+// ── Mirror of ONE real-time staging call: single failed id mapped over the
+// current base (already-staged entries, or server entries when none) ──
+function stageOneOff(base: Entry[], failedId: number): Entry[] {
+  return base.map(e => (e.modelDbId === failedId ? { ...e, enabled: false } : e))
+}
+
+// ── Mirror of the staging base: staged entries win when they belong to the
+// active profile, otherwise fall back to the server snapshot ──
+function pickStagingBase(
+  prev: { profileId: number | null; entries: Entry[] } | null,
+  activeProfileId: number | null,
+  serverEntries: Entry[],
+): Entry[] {
+  return prev && prev.profileId === activeProfileId ? prev.entries : serverEntries
+}
+
+// ── Mirror of probeAndTrack's abort contract: null on abort (never staged),
+// false on real failure (staged immediately, even mid-run) ──
+function stagesImmediately(probeResult: boolean | null): boolean {
+  return probeResult === false
 }
 
 // ── Mirror of the stop-toggle spinner clear (shared with handleTestAll) ──
@@ -84,8 +102,9 @@ describe('failed staged off / ok untouched, priority preserved (1)', () => {
 })
 
 describe('all-ok run stages nothing (2)', () => {
-  it('empty failedIds never stages (localEntries stays null)', () => {
-    expect(shouldStage(false, 0)).toBe(false)
+  it('ok results never stage (only false stages)', () => {
+    expect(stagesImmediately(true)).toBe(false)
+    expect(stagesImmediately(null)).toBe(false)
     const staged: { profileId: number | null; entries: Entry[] } | null = null
     expect(staged).toBeNull()
   })
@@ -96,10 +115,47 @@ describe('all-ok run stages nothing (2)', () => {
   })
 })
 
-describe('abort stages nothing (3)', () => {
-  it('aborted guard blocks staging even with failures collected', () => {
-    expect(shouldStage(true, 2)).toBe(false)
-    expect(shouldStage(false, 2)).toBe(true)
+describe('abort semantics: earlier failures persist, aborted probe never stages (3)', () => {
+  it('null (aborted probe) never stages; false (real failure) stages immediately', () => {
+    expect(stagesImmediately(null)).toBe(false)
+    expect(stagesImmediately(false)).toBe(true)
+    expect(stagesImmediately(true)).toBe(false)
+  })
+
+  it('failures staged before Stop survive the abort (no end-of-run gate)', () => {
+    const server: Entry[] = [
+      { modelDbId: 11, priority: 1, enabled: true },
+      { modelDbId: 22, priority: 2, enabled: true },
+      { modelDbId: 33, priority: 3, enabled: true },
+    ]
+    // Probe 11 fails -> staged immediately; probe 22 ok; Stop pressed.
+    let staged: Entry[] | null = null
+    staged = stageOneOff(staged ?? server, 11)
+    expect(staged.find(e => e.modelDbId === 11)?.enabled).toBe(false)
+    expect(staged.find(e => e.modelDbId === 22)).toEqual(server[1])
+    expect(staged.find(e => e.modelDbId === 33)).toEqual(server[2])
+  })
+
+  it('stoppings build on already-staged entries, not the stale server snapshot', () => {
+    const server: Entry[] = [
+      { modelDbId: 11, priority: 1, enabled: true },
+      { modelDbId: 22, priority: 2, enabled: true },
+    ]
+    const activeProfileId = 7
+    let prev: { profileId: number | null; entries: Entry[] } | null = null
+    // First failure: no staging yet -> base is the server snapshot.
+    prev = { profileId: activeProfileId, entries: stageOneOff(pickStagingBase(prev, activeProfileId, server), 11) }
+    // Second failure: base is the already-staged entries (11 stays off).
+    prev = { profileId: activeProfileId, entries: stageOneOff(pickStagingBase(prev, activeProfileId, server), 22) }
+    expect(prev.entries.find(e => e.modelDbId === 11)?.enabled).toBe(false)
+    expect(prev.entries.find(e => e.modelDbId === 22)?.enabled).toBe(false)
+  })
+
+  it('stale staging from another profile falls back to the server snapshot', () => {
+    const server: Entry[] = [{ modelDbId: 11, priority: 1, enabled: true }]
+    const prev = { profileId: 999, entries: [{ modelDbId: 11, priority: 1, enabled: false }] }
+    expect(pickStagingBase(prev, 7, server)).toEqual(server)
+    expect(pickStagingBase(prev, 999, server)).toEqual(prev.entries)
   })
 
   it('stop-clear deletes testing spinners but keeps ok/error + unprobed results', () => {
@@ -114,17 +170,23 @@ describe('abort stages nothing (3)', () => {
     expect(next.has(2)).toBe(false)
   })
 
-  it('an aborted run never probes ids past the stop point', async () => {
+  it('an aborted run never probes ids past the stop point (earlier failure still staged)', () => {
     const probed: number[] = []
     const ac = new AbortController()
     const ids = [11, 22, 33]
+    const server: Entry[] = ids.map((id, i) => ({ modelDbId: id, priority: i + 1, enabled: true }))
+    let staged: Entry[] | null = null
     for (let i = 0; i < ids.length; i++) {
       if (ac.signal.aborted) break
       probed.push(ids[i])
-      if (i === 0) ac.abort() // Stop pressed after the first probe
+      if (i === 0) {
+        staged = stageOneOff(staged ?? server, ids[i]) // first probe failed -> staged at once
+        ac.abort() // Stop pressed after the first probe
+      }
     }
     expect(probed).toEqual([11])
-    expect(shouldStage(ac.signal.aborted, 1)).toBe(false)
+    expect(staged?.find(e => e.modelDbId === 11)?.enabled).toBe(false)
+    expect(staged?.find(e => e.modelDbId === 22)).toEqual(server[1])
   })
 })
 
@@ -209,12 +271,15 @@ describe('Save payload shape (6)', () => {
 })
 
 describe('source pins (7)', () => {
-  it('pins handleTestAndDisable + testDisableRef + staging in FallbackPage source', () => {
+  it('pins real-time per-failure staging via functional setStaged in FallbackPage source', () => {
     expect(page).toContain('handleTestAndDisable')
     expect(page).toContain('testDisableRef')
-    expect(page).toContain('setStaged({ profileId: activeProfileId, entries: allEntries.map')
-    expect(page).toContain('failedIds.size > 0')
-    expect(page).toContain('if (!ac.signal.aborted && failedIds.size > 0)')
+    expect(page).toContain('setStaged(prev =>')
+    expect(page).toContain('prev.entries : entries')
+    expect(page).toContain('e.modelDbId === failedId')
+    // No end-of-run batch gate anymore: failures stage the moment they happen.
+    expect(page).not.toContain('failedIds.size > 0')
+    expect(page).not.toContain('entries: allEntries.map(e => (failed.has(e.modelDbId)')
   })
 
   it('handler stages via setStaged/setLocalEntries and performs no PUT itself', () => {
