@@ -270,6 +270,8 @@ export default function FallbackPage() {
   // request at a time with a 900ms gap so free-tier RPMs aren't burst.
   const [testStates, setTestStates] = useState<Map<number, ModelTestState>>(new Map())
   const bulkAbortRef = useRef<AbortController | null>(null)
+  // Distinguishes Test+disable runs from plain Test-All runs (staging only).
+  const testDisableRef = useRef(false)
   const isTestingAny = useMemo(() => [...testStates.values()].some(s => s.status === 'testing'), [testStates])
   const setTestState = useCallback((id: number, st: ModelTestState) => {
     setTestStates(prev => {
@@ -362,6 +364,80 @@ export default function FallbackPage() {
     bulkAbortRef.current = null
   }, [visibleGroups, setTestState])
 
+  // Test each visible, enabled provider, then stage the failed ones off.
+  // Stages into localEntries only — nothing is saved until Save is pressed.
+  const handleTestAndDisable = useCallback(async () => {
+    // Stop-in-progress run if one is active (same Stop logic, no staging).
+    if (bulkAbortRef.current) {
+      bulkAbortRef.current.abort()
+      bulkAbortRef.current = null
+      testDisableRef.current = false
+      setTestStates(prev => {
+        const n = new Map(prev)
+        for (const [k, v] of n) if (v.status === 'testing') n.delete(k)
+        return n
+      })
+      return
+    }
+    const ids = visibleGroups.flatMap(g => g.members.filter(m => m.enabled).map(m => m.modelDbId))
+    const uniq = [...new Set(ids)]
+    if (uniq.length === 0) return
+    testDisableRef.current = true
+    const ac = new AbortController()
+    bulkAbortRef.current = ac
+    // Local probe that mirrors probeOne's state updates but returns ok so the
+    // handler can collect failures without racing async state reads.
+    // Typed (no `any`): mirrors probeOne's branches exactly.
+    type TestProbeResponse = { ok?: boolean; latencyMs?: number; replyPreview?: string; error?: string }
+    async function probeAndTrack(modelDbId: number): Promise<boolean | null> {
+      setTestState(modelDbId, { status: 'testing' })
+      try {
+        const res = await apiFetch<TestProbeResponse>('/api/fallback/test', {
+          method: 'POST',
+          body: JSON.stringify({ modelDbId }),
+          signal: ac.signal,
+        })
+        if (res && typeof res.ok === 'boolean') {
+          if (res.ok) setTestState(modelDbId, { status: 'ok', latencyMs: res.latencyMs, replyPreview: res.replyPreview })
+          else setTestState(modelDbId, { status: 'error', error: res.error ?? 'empty_response', latencyMs: res.latencyMs, replyPreview: res.replyPreview })
+          return res.ok
+        }
+        setTestState(modelDbId, { status: 'ok', latencyMs: res?.latencyMs })
+        return true
+      } catch (e: unknown) {
+        if ((e instanceof Error && e.name === 'AbortError') || ac.signal.aborted) {
+          setTestStates(prev => {
+            const n = new Map(prev)
+            if (n.get(modelDbId)?.status === 'testing') n.delete(modelDbId)
+            return n
+          })
+          return null
+        }
+        const msg: string = e instanceof Error ? e.message : 'failed'
+        setTestState(modelDbId, { status: 'error', error: msg })
+        return false
+      }
+    }
+    const failedIds = new Set<number>()
+    for (let i = 0; i < uniq.length; i++) {
+      if (ac.signal.aborted) break
+      const ok = await probeAndTrack(uniq[i])
+      if (ok === false && !ac.signal.aborted) failedIds.add(uniq[i])
+      if (i < uniq.length - 1 && !ac.signal.aborted) {
+        await new Promise<void>(resolve => {
+          const t = setTimeout(resolve, MODEL_TEST_GAP_MS)
+          ac.signal.addEventListener('abort', () => { clearTimeout(t); resolve() }, { once: true })
+        })
+      }
+    }
+    if (!ac.signal.aborted && failedIds.size > 0) {
+      const failed = new Set(failedIds)
+      setStaged({ profileId: activeProfileId, entries: allEntries.map(e => (failed.has(e.modelDbId) ? { ...e, enabled: false } : e)) })
+    }
+    testDisableRef.current = false
+    bulkAbortRef.current = null
+  }, [visibleGroups, allEntries, activeProfileId, setTestState])
+
   // Decorate rendered groups with probe state/handlers so the shared row cell
   // doesn't need its own prop plumbing change in two places.
   const decoratedGroups = useMemo(() => {
@@ -379,6 +455,10 @@ export default function FallbackPage() {
     const s = testStates.get(m.modelDbId)
     return s?.status === 'ok' || s?.status === 'error'
   })).length
+  const testAndDisableDisabled = testingVisibleTotal === 0 && !isTestingAny
+  const testAndDisableLabel = isTestingAny
+    ? `${t('models.testStop')} · ${testedVisibleCount}/${testingVisibleTotal}`
+    : t('models.testAndDisable')
 
   // Bulk on/off over what is currently on screen (#895). Curating a chain by
   // hand means turning most of the catalog off, which one row at a time over
@@ -630,7 +710,7 @@ export default function FallbackPage() {
                   <Tooltip text={t('models.enableAllHint')}>
                     <button
                       onClick={() => handleBulkToggle(true)}
-                      disabled={visibleEnabledCount === visibleGroups.length}
+                      disabled={visibleEnabledCount === visibleGroups.length || isTestingAny}
                       className="rounded-lg px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40 disabled:hover:bg-transparent"
                     >
                       {t('models.enableAll')}
@@ -639,7 +719,7 @@ export default function FallbackPage() {
                   <Tooltip text={t('models.disableAllHint')}>
                     <button
                       onClick={() => handleBulkToggle(false)}
-                      disabled={visibleEnabledCount === 0}
+                      disabled={visibleEnabledCount === 0 || isTestingAny}
                       className="rounded-lg px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-40 disabled:hover:bg-transparent"
                     >
                       {t('models.disableAll')}
@@ -677,6 +757,9 @@ export default function FallbackPage() {
                       onTestAll={handleTestAll}
                       testAllDisabled={testingVisibleTotal === 0 && !isTestingAny}
                       testAllLabel={isTestingAny ? `${t('models.testStop')} · ${testedVisibleCount}/${testingVisibleTotal}` : t('models.testAll')}
+                      onTestAndDisable={handleTestAndDisable}
+                      testAndDisableDisabled={testAndDisableDisabled}
+                      testAndDisableLabel={testAndDisableLabel}
                     />
                     <SortableContext items={decoratedGroups.map(g => `grp:${g.key}`)} strategy={verticalListSortingStrategy}>
                       <tbody>
@@ -695,6 +778,9 @@ export default function FallbackPage() {
                     onTestAll={handleTestAll}
                     testAllDisabled={testingVisibleTotal === 0 && !isTestingAny}
                     testAllLabel={isTestingAny ? `${t('models.testStop')} · ${testedVisibleCount}/${testingVisibleTotal}` : t('models.testAll')}
+                    onTestAndDisable={handleTestAndDisable}
+                    testAndDisableDisabled={testAndDisableDisabled}
+                    testAndDisableLabel={testAndDisableLabel}
                   />
                   <tbody>
                     {decoratedGroups.map(g => (
@@ -720,7 +806,7 @@ export default function FallbackPage() {
             <FloatingBar show={hasChanges}>
               <span className="text-xs text-muted-foreground">{t('common.unsavedChanges')}</span>
               <Button variant="outline" size="sm" onClick={() => setLocalEntries(null)}>{t('common.discard')}</Button>
-              <Button size="sm" onClick={handleSave} disabled={saveMutation.isPending}>
+              <Button size="sm" onClick={handleSave} disabled={saveMutation.isPending || isTestingAny}>
                 {saveMutation.isPending ? t('common.saving') : t('common.saveChanges')}
               </Button>
             </FloatingBar>

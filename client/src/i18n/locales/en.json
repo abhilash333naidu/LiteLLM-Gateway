@@ -299,7 +299,9 @@
     "testProgress": "Testing …",
     "testHint": "Per-provider live probe between Guardrails and Score.",
     "testStop": "Stop",
-    "testStopHint": "Stop the remaining probes."
+    "testStopHint": "Stop the remaining probes.",
+    "testAndDisable": "Test + disable failed",
+    "testAndDisableHint": "Probe each visible, enabled provider, then stage failed ones off. Review and press Save — nothing is saved automatically."
   },
   "strategies": {
     "explore": "Explore unmeasured models",
