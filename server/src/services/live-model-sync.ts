@@ -550,11 +550,13 @@ interface ExistingRow {
   enabled: number;
 }
 
-/** Re-listed after a live-sync deprecation: lift the tombstone and re-enable
- *  the row, its fallback chain entry and its profile entries — unless a stored
- *  override pins enabled off, or the tombstone is not ours (410-retirements
- *  from model-retirement.ts carry different reason text and are never
- *  touched). Only live-sync tombstones (`live-sync:` reason prefix) qualify. */
+/** Re-listed after a live-sync deprecation: lift the tombstone and restore the
+ *  model row — unless a stored override pins enabled off, or the tombstone is
+ *  not ours (410-retirements from model-retirement.ts carry different reason
+ *  text and are never touched). Only live-sync tombstones (`live-sync:`
+ *  reason prefix) qualify. Chain membership (fallback_config/profile_models)
+ *  is left to the user: a dashboard disable writes chain flags, and a sync
+ *  that flipped them back would resurrect explicitly-disabled models. */
 function maybeReinstateLiveModel(
   db: Db,
   platform: string,
@@ -569,8 +571,6 @@ function maybeReinstateLiveModel(
   if (getModelOverrides(db, platform, modelId).enabled === false) return false;
   clearCatalogModelTombstone(db, 'chat', platform, modelId);
   db.prepare('UPDATE models SET enabled = 1 WHERE id = ?').run(row.id);
-  db.prepare('UPDATE fallback_config SET enabled = 1 WHERE model_db_id = ?').run(row.id);
-  db.prepare('UPDATE profile_models SET enabled = 1 WHERE model_db_id = ?').run(row.id);
   counts.reinstated += 1;
   return true;
 }

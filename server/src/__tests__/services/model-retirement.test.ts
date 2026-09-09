@@ -229,7 +229,7 @@ describe('catalog sync vs. upstream retirement (#634)', () => {
     } as unknown as Parameters<typeof applyCatalog>[1];
   }
 
-  it('re-enables an auto-retired model when a later catalog still lists it', () => {
+  it('a relisted catalog clears the retirement but leaves the chain to the user', () => {
     resetModelRetirementObservations();
     const id = seedModel('eol-test-relisted');
     noteModelRetirementSignal(routeFor(id, 'eol-test-relisted'), NVIDIA_EOL, {});
@@ -237,10 +237,13 @@ describe('catalog sync vs. upstream retirement (#634)', () => {
 
     applyCatalog(getDb(), catalogWith('eol-test-relisted', true));
 
-    expect(isRoutable(id)).toBe(true);
+    // The stale retirement is lifted and the row survives, but chain
+    // membership is the user's: a boot-time sync must not resurrect chain
+    // flags (a dashboard disable writes chain flags). The user flips it on.
     expect(getCatalogModelTombstone(getDb(), 'chat', PLATFORM, 'eol-test-relisted')).toBeUndefined();
     expect(getDb().prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?')
       .get(PLATFORM, 'eol-test-relisted')).toBeDefined();
+    expect(isRoutable(id)).toBe(false);
   });
 
   it('still deletes models the USER tombstoned (unchanged behavior)', () => {
