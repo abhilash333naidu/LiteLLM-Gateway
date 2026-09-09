@@ -301,7 +301,9 @@
     "testStop": "Stop",
     "testStopHint": "Stop the remaining probes.",
     "testAndDisable": "Test + disable failed",
-    "testAndDisableHint": "Probe each visible, enabled provider, then stage failed ones off. Review and press Save — nothing is saved automatically."
+    "testAndDisableHint": "Probe each visible, enabled provider, then stage failed ones off. Review and press Save — nothing is saved automatically.",
+    "mixedOn": "{on} of {total} on",
+    "mixedHint": "Only some providers in this group are on — open the model page for per-provider switches."
   },
   "strategies": {
     "explore": "बिना मापे गए मॉडल एक्सप्लोर करें",
