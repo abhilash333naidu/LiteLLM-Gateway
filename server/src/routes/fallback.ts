@@ -325,10 +325,21 @@ fallbackRouter.put('/', (req: Request, res: Response) => {
           ON CONFLICT(profile_id, model_db_id)
           DO UPDATE SET priority = excluded.priority, enabled = excluded.enabled
         `);
+        // The legacy global table stays in lockstep: readers outside the
+        // active chain (no-profile GET, new-chain creation, declarative
+        // apply) must see the same enabled flags, or a dashboard disable
+        // "comes back" the next time one of those paths is read.
+        const upsertGlobal = db.prepare(`
+          INSERT INTO fallback_config (model_db_id, priority, enabled)
+          VALUES (?, ?, ?)
+          ON CONFLICT(model_db_id)
+          DO UPDATE SET priority = excluded.priority, enabled = excluded.enabled
+        `);
         return db.transaction(() => {
           for (const entry of parsed.data) {
             if (!known.has(entry.modelDbId)) continue;
             upsert.run(activeProfileId, entry.modelDbId, entry.priority, entry.enabled ? 1 : 0);
+            upsertGlobal.run(entry.modelDbId, entry.priority, entry.enabled ? 1 : 0);
           }
         });
       })()

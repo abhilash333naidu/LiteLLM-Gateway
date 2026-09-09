@@ -779,7 +779,7 @@ describe('live-model-sync deprecation and reinstate', () => {
     expect(liveRows()).toEqual([]);
   });
 
-  it('re-listing reinstates only live-sync tombstones', async () => {
+  it('re-listing reinstates only live-sync tombstones (chain left to the user)', async () => {
     const reId = addLiveRow('openrouter', 'back-model', 0);
     const { recordCatalogModelTombstone } = await import('../../services/model-state.js');
     recordCatalogModelTombstone(getDb(), 'chat', 'openrouter', 'back-model', {
@@ -791,7 +791,10 @@ describe('live-model-sync deprecation and reinstate', () => {
     const result = await runLiveModelSync(getDb());
     expect(result.counts.reinstated).toBe(1);
     expect((getDb().prepare('SELECT enabled FROM models WHERE id = ?').get(reId) as { enabled: number }).enabled).toBe(1);
-    expect((getDb().prepare('SELECT enabled FROM fallback_config WHERE model_db_id = ?').get(reId) as { enabled: number }).enabled).toBe(1);
+    // Chain membership is the user's: reinstate restores availability but must
+    // not resurrect chain flags (a dashboard disable writes chain flags, and
+    // flipping them here re-enabled explicitly-disabled models on boot).
+    expect((getDb().prepare('SELECT enabled FROM fallback_config WHERE model_db_id = ?').get(reId) as { enabled: number }).enabled).toBe(0);
     expect(tombstoneOf('openrouter', 'back-model')).toBeUndefined();
   });
 

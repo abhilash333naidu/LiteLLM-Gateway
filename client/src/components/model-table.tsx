@@ -434,6 +434,10 @@ export function GroupHeaderCells({ group, rank, dragHandle, onToggleGroup, allRo
   const { t } = useI18n()
   const anyEnabled = group.members.some(m => m.enabled)
   const solo = group.members.length === 1
+  // A Test+disable run (or a hand toggle) can leave a group half-off. The
+  // switch alone would then read as fully on, so show the split explicitly.
+  const onCount = group.members.filter(m => m.enabled).length
+  const mixed = !solo && onCount > 0 && onCount < group.members.length
   const best = group.members.reduce((b, m) => ((m.score ?? -1) > (b.score ?? -1) ? m : b), group.members[0])
   const guard = (best.headroom ?? 1) * (best.rateLimit ?? 1)
   // Remaining time-window quota for this group (#876): the member with the most
@@ -524,7 +528,16 @@ export function GroupHeaderCells({ group, rank, dragHandle, onToggleGroup, allRo
         )}
       </td>
       <td className="py-2 pr-3 align-middle text-right" onClick={e => e.stopPropagation()}>
-        <Switch checked={anyEnabled} onCheckedChange={(c) => onToggleGroup(group.members.map(m => m.modelDbId), c)} />
+        <span className="inline-flex items-center justify-end gap-1.5">
+          {mixed && (
+            <Tooltip text={t('models.mixedHint')}>
+              <span className="text-[10px] rounded-full px-1.5 py-0.5 bg-amber-600/15 text-amber-700 dark:text-amber-400 tabular-nums cursor-help whitespace-nowrap">
+                {t('models.mixedOn', { on: onCount, total: group.members.length })}
+              </span>
+            </Tooltip>
+          )}
+          <Switch checked={anyEnabled} onCheckedChange={(c) => onToggleGroup(group.members.map(m => m.modelDbId), c)} />
+        </span>
       </td>
     </>
   )

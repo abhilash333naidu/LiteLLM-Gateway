@@ -303,7 +303,9 @@
     "testAndDisable": "Test + disable failed",
     "testAndDisableHint": "Probe each visible, enabled provider, then stage failed ones off. Review and press Save — nothing is saved automatically.",
     "disabledSectionTitle": "Disabled ({count})",
-    "disabledSectionHint": "Fully-off models sink here. Turn one on to move it back up."
+    "disabledSectionHint": "Fully-off models sink here. Turn one on to move it back up.",
+    "mixedOn": "{on} of {total} on",
+    "mixedHint": "Only some providers in this group are on — open the model page for per-provider switches."
   },
   "strategies": {
     "explore": "Preskúmavať nezmerané modely",

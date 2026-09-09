@@ -307,6 +307,14 @@ describe('source pins (7)', () => {
     expect(table).toContain("t('models.testAndDisableHint')")
   })
 
+  it('pins half-off group split badge (mixedOn/mixedHint) in model-table', () => {
+    expect(table).toContain('t(\'models.mixedOn\'')
+    expect(table).toContain("t('models.mixedHint')")
+    expect(table).toContain('onCount < group.members.length')
+    expect(en.models.mixedOn).toContain('{on}')
+    expect(en.models.mixedHint).toBeTruthy()
+  })
+
   it('pins en.json testAndDisable + hint strings', () => {
     expect(en.models.testAndDisable).toBeTruthy()
     expect(en.models.testAndDisableHint).toBeTruthy()

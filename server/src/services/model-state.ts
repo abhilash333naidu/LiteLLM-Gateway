@@ -180,6 +180,14 @@ export function retireCatalogModelUpstream(
  * Lift an upstream retirement: a catalog that still lists the model — and lists
  * it enabled — is newer and better evidence than one provider's 404. Returns
  * true when a retirement was actually lifted.
+ *
+ * Chain membership is the user's, not the sync's: clearing the tombstone does
+ * NOT touch fallback_config/profile_models. A dashboard disable (Test+disable,
+ * switches) writes chain flags, and a boot-time reinstate that flipped them
+ * back to 1 resurrected explicitly-disabled models on every restart. The user
+ * flips the model back on if they want it (the same contract retirement
+ * offers). An explicit model_overrides pin on enabled blocks even the
+ * tombstone clear, in parity with the live-sync reinstate path.
  */
 export function reinstateUpstreamRetiredCatalogModel(
   db: Db,
@@ -187,14 +195,8 @@ export function reinstateUpstreamRetiredCatalogModel(
   modelId: string,
 ): boolean {
   if (getCatalogModelTombstone(db, 'chat', platform, modelId)?.source !== 'upstream_eol') return false;
+  if (getModelOverrides(db, platform, modelId).enabled === false) return false;
   clearCatalogModelTombstone(db, 'chat', platform, modelId);
-  const row = db
-    .prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?')
-    .get(platform, modelId) as { id: number } | undefined;
-  if (row) {
-    db.prepare('UPDATE fallback_config SET enabled = 1 WHERE model_db_id = ?').run(row.id);
-    db.prepare('UPDATE profile_models SET enabled = 1 WHERE model_db_id = ?').run(row.id);
-  }
   return true;
 }
 
